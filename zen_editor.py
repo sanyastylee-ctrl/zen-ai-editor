@@ -1,10 +1,35 @@
 import sys
 import os
+import requests
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
                              QVBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                              QFrame, QHBoxLayout, QTreeView)
 from PyQt6.QtGui import QFont, QFileSystemModel
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+# Поток для связи с Ollama, чтобы не вешать GUI
+class OllamaWorker(QThread):
+    response_ready = pyqtSignal(str)
+    
+    def __init__(self, prompt):
+        super().__init__()
+        self.prompt = prompt
+
+    def run(self):
+        try:
+            url = "http://localhost:11434/api/generate"
+            payload = {
+                "model": "qwen2.5:14b",
+                "prompt": self.prompt,
+                "stream": False
+            }
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            text = response.json().get("response", "")
+            self.response_ready.emit(text)
+        except Exception as e:
+            self.response_ready.emit(f"Error: {str(e)}")
 
 class ZenEditor(QMainWindow):
     def __init__(self):
@@ -135,8 +160,9 @@ class ZenEditor(QMainWindow):
             self.chat_history.append("<i style='color:#888888;'>Qwen думает...</i><br>")
             self.chat_input.clear()
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = ZenEditor()
-    window.show()
-    sys.exit(app.exec())
+            self.worker = OllamaWorker(text)
+            self.worker.response_ready.connect(self.handle_ai_response)
+            self.worker.start()
+
+    def handle_ai_response(self, text):
+        self.chat_history.append(f"<span style='color: green;'><b>Qwen:</b> {text}</span><br>")
