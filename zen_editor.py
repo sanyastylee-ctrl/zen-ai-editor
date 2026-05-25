@@ -5,7 +5,7 @@ import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
                              QVBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                              QFrame, QHBoxLayout, QTreeView)
-from PyQt6.QtGui import QFont, QFileSystemModel
+from PyQt6.QtGui import QFont, QFileSystemModel, QTextCursor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 class OllamaWorker(QThread):
@@ -166,7 +166,7 @@ class ZenEditor(QMainWindow):
             else:
                 full_prompt = text
 
-            self.chat_history.append(f"<b style='color:#569CD6;'>Ты:</b> {text}")
+            self.chat_history.append(f"<b style='color:#569CD6;'>Ты:</b> {text}<br><br><b style='color:#4EC9B0;'>Qwen:</b>")
             self.chat_input.clear()
 
             self.worker = OllamaWorker(full_prompt)
@@ -176,12 +176,13 @@ class ZenEditor(QMainWindow):
     
     def handle_chunk(self, chunk):
         cursor = self.chat_history.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(chunk)
         self.chat_history.setTextCursor(cursor)
+        self.chat_history.ensureCursorVisible()
 
     def finish_stream(self):
-        pass
+        self.chat_history.append("<br><br>")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
