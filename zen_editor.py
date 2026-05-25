@@ -5,8 +5,63 @@ import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
                              QVBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                              QFrame, QHBoxLayout, QTreeView)
-from PyQt6.QtGui import QFont, QFileSystemModel, QTextCursor
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QFileSystemModel, QTextCursor, QSyntaxHighlighter, QTextCharFormat, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
+
+class PythonHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+        
+        self.highlightingRules = []
+
+        # Keywords
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor("#569CD6"))
+        keywords = [
+            "def", "class", "import", "from", "return", "if", 
+            "elif", "else", "try", "except", "for", "while",
+            "in", "is", "and", "or", "not", "with", "as", "pass"
+        ]
+        for keyword in keywords:
+            rule = (QRegularExpression(r'\b' + keyword + r'\b'), keyword_format)
+            self.highlightingRules.append(rule)
+
+        # Numbers
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor("#B5CEA8"))
+        rule = (QRegularExpression(r'\b[0-9]+\b'), number_format)
+        self.highlightingRules.append(rule)
+
+        # Class names and method names
+        class_method_format = QTextCharFormat()
+        class_method_format.setForeground(QColor("#DCDCAA"))
+        rule = (QRegularExpression(r'\b[A-Za-z0-9_]+(?=\()'), class_method_format)
+        self.highlightingRules.append(rule)
+
+        # Strings
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor("#CE9178"))
+        rules = [
+            (r'"[^"\\]*(\\.[^"\\]*)*"', string_format),
+            (r"'[^'\\]*(\\.[^'\\]*)*'", string_format)
+        ]
+        for pattern, fmt in rules:
+            self.highlightingRules.append((QRegularExpression(pattern), fmt))
+
+        # Comments
+        comment_format = QTextCharFormat()
+        comment_format.setForeground(QColor("#6A9955"))
+        comment_format.setFontItalic(True)
+        rule = (QRegularExpression(r'#[^\n]*'), comment_format)
+        self.highlightingRules.append(rule)
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self.highlightingRules:
+            match_iterator = pattern.globalMatch(text)
+            while match_iterator.hasNext():
+                match = match_iterator.next()
+                self.setFormat(match.capturedStart(), match.capturedLength(), fmt)
+
 
 class OllamaWorker(QThread):
     chunk_received = pyqtSignal(str)
@@ -134,6 +189,8 @@ class ZenEditor(QMainWindow):
         self.code_editor = QTextEdit()
         self.code_editor.setFont(QFont("Consolas", 11))
         self.code_editor.setPlaceholderText("# Чистый холст для кода...")
+        
+        self.highlighter = PythonHighlighter(self.code_editor.document())
 
         self.work_splitter.addWidget(chat_zone)
         self.work_splitter.addWidget(self.code_editor)
