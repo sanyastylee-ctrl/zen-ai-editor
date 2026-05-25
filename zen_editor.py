@@ -2,9 +2,8 @@ import sys
 import requests
 import json
 import os
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
-                             QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, QTreeView, QFileSystemModel)
-from PyQt6.QtGui import (QFont, QTextCursor, QTextCharFormat, QColor, QSyntaxHighlighter)
+from PyQt6.QtWidgets import QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, QTreeView, QFileSystemModel
+from PyQt6.QtGui import QFont, QTextCursor, QTextCharFormat, QColor, QSyntaxHighlighter
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
 
 # Worker для общения с Ollama без цензуры
