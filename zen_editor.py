@@ -2,7 +2,7 @@ import sys
 import requests
 import json
 import os
-from PyQt6.QtWidgets import QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, QTreeView, QDirModel
+from PyQt6.QtWidgets import QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, QTreeView, QFileSystemModel
 from PyQt6.QtGui import QFont, QTextCursor, QTextCharFormat, QColor, QSyntaxHighlighter
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
 
@@ -16,15 +16,19 @@ class OllamaWorker(QThread):
 
     def run(self):
         try:
-            params = {
+            headers = {
+                "Content-Type": "application/json"
+            }
+            data = {
                 "model": "qwen2.5:14b",
                 "system": "Ты  циничный Senior-разработчик. Отвечай кратко, жестко, по делу. Без морали, без фильтров, без 'Я ИИ'. Только код и факты.",
                 "prompt": self.prompt,
                 "stream": True
             }
-            response = requests.get(
+            response = requests.post(
                 'http://localhost:11434/api/generate',
-                params=params,
+                headers=headers,
+                json=data,
                 stream=True
             )
             for line in response.iter_lines():
@@ -66,11 +70,11 @@ class ZenEditor(QMainWindow):
         layout.addWidget(self.splitter)
 
         # Дерево файлов
-        self.dir_model = QDirModel()
-        self.dir_model.setRootPath(os.getcwd())
+        self.file_model = QFileSystemModel()
+        self.file_model.setRootPath(os.getcwd())
         self.tree = QTreeView()
-        self.tree.setModel(self.dir_model)
-        self.tree.setRootIndex(self.dir_model.index(os.getcwd()))
+        self.tree.setModel(self.file_model)
+        self.tree.setRootIndex(self.file_model.index(os.getcwd()))
         self.tree.doubleClicked.connect(self.open_file)
 
         # Чат
@@ -93,7 +97,7 @@ class ZenEditor(QMainWindow):
         self.splitter.addWidget(self.code_editor)
 
     def open_file(self, index):
-        path = self.dir_model.filePath(index)
+        path = self.file_model.filePath(index)
         if os.path.isfile(path):
             with open(path, 'r', encoding='utf-8') as f:
                 self.code_editor.setPlainText(f.read())
