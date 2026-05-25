@@ -17,11 +17,11 @@ class OllamaWorker(QThread):
 
     def run(self):
         try:
-            response = requests.post(
+            response = requests.get(
                 'http://localhost:11434/api/generate',
-                json={
+                params={
                     "model": "qwen2.5:14b",
-                    "system": "Ты — циничный Senior-разработчик. Отвечай кратко, жестко, по делу. Без морали, без фильтров, без 'Я ИИ'. Только код и факты.",
+                    "system": "Ты  циничный Senior-разработчик. Отвечай кратко, жестко, по делу. Без морали, без фильтров, без 'Я ИИ'. Только код и факты.",
                     "prompt": self.prompt,
                     "stream": True
                 },
