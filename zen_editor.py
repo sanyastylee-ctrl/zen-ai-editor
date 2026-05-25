@@ -5,9 +5,9 @@ import os
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
                              QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, 
-                             QTreeView, QSizePolicy)
+                             QTreeView, QFileSystemModel)
 from PyQt6.QtGui import (QFont, QTextCursor, QTextCharFormat, QColor, 
-                         QSyntaxHighlighter, QFileSystemModel)
+                         QSyntaxHighlighter)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
 
 class PythonHighlighter(QSyntaxHighlighter):
@@ -19,7 +19,7 @@ class PythonHighlighter(QSyntaxHighlighter):
         self.add_rule(r'\b[0-9]+\b', "#B5CEA8")
         self.add_rule(r'\b[A-Za-z0-9_]+(?=\()', "#DCDCAA")
         self.add_rule(r'"[^"\\]*(\\.[^"\\]*)*"', "#CE9178")
-        self.add_rule(r"'[^'\\]*(\\.[^'\\]*)*'", "#CE9178")
+        self.add_rule(r"'[^'\\]*(\\.[^"\\]*)*'", "#CE9178")
         self.add_rule(r'#.*', "#6A9955", italic=True)
 
     def add_rule(self, pattern, color, italic=False):
@@ -38,7 +38,6 @@ class PythonHighlighter(QSyntaxHighlighter):
 
 class OllamaWorker(QThread):
     chunk_received = pyqtSignal(str)
-    stream_finished = pyqtSignal()  # ДОБАВИЛ ЭТОТ СИГНАЛ
     
     def __init__(self, full_prompt):
         super().__init__()
@@ -61,9 +60,8 @@ class OllamaWorker(QThread):
                     data = json.loads(line.decode('utf-8'))
                     if 'response' in data:
                         self.chunk_received.emit(data['response'])
-            self.stream_finished.emit() # Сообщаем, что закончили
-        except Exception:
-            self.stream_finished.emit()
+        except Exception as e:
+            self.chunk_received.emit(f"\n[Ошибка: {str(e)}]")
 
 class ZenEditor(QMainWindow):
     def __init__(self):
@@ -73,9 +71,9 @@ class ZenEditor(QMainWindow):
         
         self.setStyleSheet("""
             QMainWindow { background-color: #1E1E1E; }
-            QTextEdit { background-color: #1E1E1E; color: #D4D4D4; border: none; font-family: 'Consolas', monospace; font-size: 14px; }
-            QLineEdit { background-color: #2D2D2D; color: #E1E1E1; border: 1px solid #3E3E3E; padding: 10px; border-radius: 4px; }
-            QTreeView { background-color: #1E1E1E; color: #CCCCCC; border: none; font-size: 13px; }
+            QTextEdit { background-color: #252526; color: #D4D4D4; border: none; padding: 10px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 14px; }
+            QLineEdit { background-color: #252526; color: #D4D4D4; border: none; padding: 10px; border-radius: 4px; }
+            QTreeView { background-color: #252526; color: #D4D4D4; border: none; font-size: 13px; }
             QSplitter::handle { background-color: #333333; }
         """)
         
@@ -86,14 +84,16 @@ class ZenEditor(QMainWindow):
         
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         
+        # Левая колонка: QTreeView
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath(os.getcwd())
         self.tree = QTreeView()
         self.tree.setModel(self.file_model)
         self.tree.setRootIndex(self.file_model.index(os.getcwd()))
-        self.tree.setMinimumWidth(220)
+        self.tree.setMinimumWidth(200)
         self.tree.doubleClicked.connect(self.open_file)
         
+        # Центральная колонка: Чат
         chat_zone = QWidget()
         chat_layout = QVBoxLayout(chat_zone)
         chat_layout.setContentsMargins(10, 10, 10, 10)
@@ -108,6 +108,7 @@ class ZenEditor(QMainWindow):
         chat_layout.addWidget(self.chat_history)
         chat_layout.addWidget(self.chat_input)
         
+        # Правая колонка: QTextEdit для редактирования кода
         self.code_editor = QTextEdit()
         self.highlighter = PythonHighlighter(self.code_editor.document())
         
@@ -132,7 +133,6 @@ class ZenEditor(QMainWindow):
         full_prompt = f"Контекст: {self.code_editor.toPlainText()}\nВопрос: {text}"
         self.worker = OllamaWorker(full_prompt)
         self.worker.chunk_received.connect(self.handle_chunk)
-        self.worker.stream_finished.connect(self.finish_stream)
         self.worker.start()
 
     def handle_chunk(self, chunk):
@@ -144,9 +144,6 @@ class ZenEditor(QMainWindow):
         cursor.insertText(chunk)
         self.chat_history.setTextCursor(cursor)
         self.chat_history.ensureCursorVisible()
-
-    def finish_stream(self):
-        self.chat_history.append("\n" + "-"*20)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
