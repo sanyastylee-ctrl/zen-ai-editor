@@ -10,6 +10,32 @@ from PyQt6.QtGui import (QFont, QTextCursor, QTextCharFormat, QColor,
                          QSyntaxHighlighter, QFileSystemModel)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
 
+class PythonHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+        self.highlightingRules = []
+        
+        self.add_rule(r'\b(def|class|import|from|return|if|elif|else|try|except|for|while|in|is|and|or|not|with|as|pass)\b', "#569CD6")
+        self.add_rule(r'\b[0-9]+\b', "#B5CEA8")
+        self.add_rule(r'\b[A-Za-z0-9_]+(?=\()', "#DCDCAA")
+        self.add_rule(r'"[^"\\]*(\\.[^"\\]*)*"', "#CE9178")
+        self.add_rule(r"'[^'\\]*(\\.[^'\\]*)*'", "#CE9178")
+        self.add_rule(r'#.*', "#6A9955", italic=True)
+
+    def add_rule(self, pattern, color, italic=False):
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if italic:
+            fmt.setFontItalic(True)
+        self.highlightingRules.append((QRegularExpression(pattern), fmt))
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self.highlightingRules:
+            matchIterator = pattern.globalMatch(text)
+            while matchIterator.hasNext():
+                match = matchIterator.next()
+                self.setFormat(match.capturedStart(), match.capturedLength(), fmt)
+
 class OllamaWorker(QThread):
     chunk_received = pyqtSignal(str)
     stream_finished = pyqtSignal()  # ДОБАВИЛ ЭТОТ СИГНАЛ
@@ -38,22 +64,6 @@ class OllamaWorker(QThread):
             self.stream_finished.emit() # Сообщаем, что закончили
         except Exception:
             self.stream_finished.emit()
-
-class PythonHighlighter(QSyntaxHighlighter):
-    def __init__(self, document):
-        super().__init__(document)
-        self.rules = []
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor("#569CD6"))
-        for word in [r'\bdef\b', r'\bclass\b', r'\bimport\b', r'\breturn\b', r'\bif\b', r'\bfor\b']:
-            self.rules.append((QRegularExpression(word), fmt))
-        
-    def highlightBlock(self, text):
-        for pattern, fmt in self.rules:
-            it = pattern.globalMatch(text)
-            while it.hasNext():
-                m = it.next()
-                self.setFormat(m.capturedStart(), m.capturedLength(), fmt)
 
 class ZenEditor(QMainWindow):
     def __init__(self):
@@ -127,7 +137,10 @@ class ZenEditor(QMainWindow):
 
     def handle_chunk(self, chunk):
         cursor = self.chat_history.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#D4D4D4"))
+        fmt.setFontWeight(QFont.Weight.Normal)
+        cursor.setCharFormat(fmt)
         cursor.insertText(chunk)
         self.chat_history.setTextCursor(cursor)
         self.chat_history.ensureCursorVisible()
