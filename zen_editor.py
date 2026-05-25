@@ -19,7 +19,7 @@ class PythonHighlighter(QSyntaxHighlighter):
         self.add_rule(r'\b[0-9]+\b', "#B5CEA8")
         self.add_rule(r'\b[A-Za-z0-9_]+(?=\()', "#DCDCAA")
         self.add_rule(r'"[^"\\]*(\\.[^"\\]*)*"', "#CE9178")
-        self.add_rule(r"'[^'\\]*(\\.[^"\\]*)*'", "#CE9178")
+        self.add_rule(r"'[^'\\]*(\\.[^'\\]*)*", "#CE9178")  # Удален пробел после символа \
         self.add_rule(r'#.*', "#6A9955", italic=True)
 
     def add_rule(self, pattern, color, italic=False):
