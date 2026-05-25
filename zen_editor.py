@@ -1,10 +1,31 @@
 import sys
 import os
+import requests
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QWidget, 
                              QVBoxLayout, QTextEdit, QLineEdit, QPushButton, 
                              QFrame, QHBoxLayout, QTreeView)
 from PyQt6.QtGui import QFont, QFileSystemModel
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+class OllamaWorker(QThread):
+    response_ready = pyqtSignal(str)
+
+    def __init__(self, prompt):
+        super().__init__()
+        self.prompt = prompt
+
+    def run(self):
+        try:
+            response = requests.post("http://localhost:11434/api/generate", json={
+                "model": "qwen2.5:14b",
+                "prompt": self.prompt,
+                "stream": False
+            })
+            text = response.json()['response']
+            self.response_ready.emit(text)
+        except Exception as e:
+            self.response_ready.emit(f"Ошибка: {str(e)}")
 
 class ZenEditor(QMainWindow):
     def __init__(self):
@@ -12,7 +33,7 @@ class ZenEditor(QMainWindow):
         self.setWindowTitle("Zen AI Editor")
         self.resize(1200, 800)
         self.setMinimumSize(800, 600)
-        
+
         # Премиальная темная тема
         self.setStyleSheet("""
             QMainWindow { background-color: #1E1E1E; }
@@ -132,8 +153,14 @@ class ZenEditor(QMainWindow):
         text = self.chat_input.text().strip()
         if text:
             self.chat_history.append(f"<b style='color:#569CD6;'>Ты:</b> {text}")
-            self.chat_history.append("<i style='color:#888888;'>Qwen думает...</i><br>")
             self.chat_input.clear()
+
+            self.worker = OllamaWorker(text)
+            self.worker.response_ready.connect(self.handle_ai_response)
+            self.worker.start()
+
+    def handle_ai_response(self, text):
+        self.chat_history.append(f"<span style='color:#00FF00;'>Qwen:</span> {text}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
