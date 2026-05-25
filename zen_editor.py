@@ -234,6 +234,12 @@ class ZenEditor(QMainWindow):
     def handle_chunk(self, chunk):
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#D4D4D4"))
+        fmt.setFontWeight(QFont.Weight.Normal)
+        cursor.setCharFormat(fmt)
+
         cursor.insertText(chunk)
         self.chat_history.setTextCursor(cursor)
         self.chat_history.ensureCursorVisible()
