@@ -9,7 +9,8 @@ from PyQt6.QtGui import QFont, QFileSystemModel
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 class OllamaWorker(QThread):
-    response_ready = pyqtSignal(str)
+    chunk_received = pyqtSignal(str)
+    stream_finished = pyqtSignal()
 
     def __init__(self, prompt):
         super().__init__()
@@ -20,12 +21,18 @@ class OllamaWorker(QThread):
             response = requests.post("http://localhost:11434/api/generate", json={
                 "model": "qwen2.5:14b",
                 "prompt": self.prompt,
-                "stream": False
-            })
-            text = response.json()['response']
-            self.response_ready.emit(text)
+                "stream": True
+            }, stream=True)
+            
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line.decode('utf-8'))
+                    if 'response' in data:
+                        self.chunk_received.emit(data['response'])
         except Exception as e:
-            self.response_ready.emit(f"Ошибка: {str(e)}")
+            self.chunk_received.emit(f"Ошибка: {str(e)}")
+        
+        self.stream_finished.emit()
 
 class ZenEditor(QMainWindow):
     def __init__(self):
@@ -163,11 +170,18 @@ class ZenEditor(QMainWindow):
             self.chat_input.clear()
 
             self.worker = OllamaWorker(full_prompt)
-            self.worker.response_ready.connect(self.handle_ai_response)
+            self.worker.chunk_received.connect(self.handle_chunk)
+            self.worker.stream_finished.connect(self.finish_stream)
             self.worker.start()
+    
+    def handle_chunk(self, chunk):
+        cursor = self.chat_history.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(chunk)
+        self.chat_history.setTextCursor(cursor)
 
-    def handle_ai_response(self, text):
-        self.chat_history.append(f"<span style='color:#00FF00;'>Qwen:</span> {text}")
+    def finish_stream(self):
+        pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
