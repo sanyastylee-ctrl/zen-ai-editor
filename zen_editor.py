@@ -152,10 +152,17 @@ class ZenEditor(QMainWindow):
     def send_message(self):
         text = self.chat_input.text().strip()
         if text:
+            current_code = self.code_editor.toPlainText().strip()
+
+            if current_code:
+                full_prompt = f"Контекст (текущий код в редакторе):\n{current_code}\n\nВопрос: {text}"
+            else:
+                full_prompt = text
+
             self.chat_history.append(f"<b style='color:#569CD6;'>Ты:</b> {text}")
             self.chat_input.clear()
 
-            self.worker = OllamaWorker(text)
+            self.worker = OllamaWorker(full_prompt)
             self.worker.response_ready.connect(self.handle_ai_response)
             self.worker.start()
 
