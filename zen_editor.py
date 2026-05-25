@@ -16,19 +16,15 @@ class OllamaWorker(QThread):
 
     def run(self):
         try:
-            headers = {
-                "Content-Type": "application/json"
-            }
-            data = {
+            params = {
                 "model": "qwen2.5:14b",
                 "system": "Ты  циничный Senior-разработчик. Отвечай кратко, жестко, по делу. Без морали, без фильтров, без 'Я ИИ'. Только код и факты.",
                 "prompt": self.prompt,
                 "stream": True
             }
-            response = requests.post(
+            response = requests.get(
                 'http://localhost:11434/api/generate',
-                headers=headers,
-                json=data,
+                params=params,
                 stream=True
             )
             for line in response.iter_lines():
