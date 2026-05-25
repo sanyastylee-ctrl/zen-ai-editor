@@ -2,15 +2,16 @@ import sys
 from PyQt5.QtWidgets import QMainWindow, QFrame, QApplication, QTextEdit
 from PyQt5.QtGui import QColor, QTextCharFormat
 from PyQt5.QtCore import pyqtSignal, QThread, QRegExp
+from PyQt5.Qsci import QsciLexerPython, QsciScintilla
 
 class HighlightingRule:
     def __init__(self, pattern, format):
         self.pattern = pattern
         self.format = format
 
-class PythonHighlighter(QSyntaxHighlighter):
+class PythonHighlighter(QsciLexerPython):
     def __init__(self, document):
-        super().__init__(document)
+        super().__init__()
         
         self.highlightingRules = []
         
@@ -74,10 +75,11 @@ class ZenEditor(QMainWindow):
             /* ... other styles ... */
         """)
         
-        self.text_edit = QTextEdit(self)
+        self.text_edit = QsciScintilla(self)
         self.setCentralWidget(self.text_edit)
         
-        highlighter = PythonHighlighter(self.text_edit.document())
+        highlighter = PythonHighlighter()
+        self.text_edit.setLexer(highlighter)
     
     def toggle_sidebar(self):
         # ... implementation of toggle_sidebar ...
@@ -89,7 +91,7 @@ class ZenEditor(QMainWindow):
     
     def send_message(self):
         # ... implementation of send_message ...
-        prompt = self.text_edit.toPlainText()
+        prompt = self.text_edit.text()
         worker = OllamaWorker(prompt)
         worker.chunk_received.connect(self.handle_chunk)
         worker.start()
