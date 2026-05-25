@@ -1,7 +1,12 @@
 import sys
-from PyQt5.QtWidgets import QMainWindow, QFrame
+from PyQt5.QtWidgets import QMainWindow, QFrame, QApplication, QTextEdit
 from PyQt5.QtGui import QColor, QTextCharFormat
-from PyQt5.QtCore import pyqtSignal, QThread
+from PyQt5.QtCore import pyqtSignal, QThread, QRegExp
+
+class HighlightingRule:
+    def __init__(self, pattern, format):
+        self.pattern = pattern
+        self.format = format
 
 class PythonHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
@@ -22,7 +27,13 @@ class PythonHighlighter(QSyntaxHighlighter):
             self.highlightingRules.append(rule)
 
     def highlightBlock(self, text):
-        # ... implementation of highlightBlock ...
+        for rule in self.highlightingRules:
+            expression = QRegExp(rule.pattern)
+            index = expression.indexIn(text)
+            while index >= 0:
+                length = expression.matchedLength()
+                self.setFormat(index, length, rule.format)
+                index = expression.indexIn(text, index + length)
 
 class OllamaWorker(QThread):
     chunk_received = pyqtSignal(str)
@@ -62,20 +73,37 @@ class ZenEditor(QMainWindow):
             QFrame { background-color: #252526; border: none; }
             /* ... other styles ... */
         """)
+        
+        self.text_edit = QTextEdit(self)
+        self.setCentralWidget(self.text_edit)
+        
+        highlighter = PythonHighlighter(self.text_edit.document())
     
     def toggle_sidebar(self):
         # ... implementation of toggle_sidebar ...
+        pass
     
     def open_file(self, index):
         # ... implementation of open_file ...
+        pass
     
     def send_message(self):
         # ... implementation of send_message ...
+        prompt = self.text_edit.toPlainText()
+        worker = OllamaWorker(prompt)
+        worker.chunk_received.connect(self.handle_chunk)
+        worker.start()
     
     def handle_chunk(self, chunk):
         # ... implementation of handle_chunk ...
+        self.text_edit.append(chunk)
     
     def finish_stream(self):
         # ... implementation of finish_stream ...
+        pass
 
-# ... other classes and methods ...
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    editor = ZenEditor()
+    editor.show()
+    sys.exit(app.exec_())
