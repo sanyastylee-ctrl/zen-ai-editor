@@ -1,0 +1,15 @@
+# --- core ---
+PyQt6>=6.6
+PyQt6-QScintilla>=2.14  # подсветка синтаксиса в редакторе
+
+# --- модели ---
+# Под GPU установка llama-cpp-python с CUDA-сборкой:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# Под CPU:
+#   pip install llama-cpp-python
+llama-cpp-python>=0.2.90
+
+# --- RAG (опционально, но рекомендуется) ---
+faiss-cpu>=1.7.4
+sentence-transformers>=2.7
+numpy>=1.24
