@@ -20,7 +20,7 @@ import re
 import sys
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFileSystemModel, QFont, QKeySequence, QShortcut
+from PyQt6.QtGui import QFileSystemModel, QFont, QKeySequence, QShortcut, QAction
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QFrame, QTreeView, QTabWidget,
@@ -31,6 +31,7 @@ from core.profiles import ProfileManager, ProfileKind, AIProfile
 from core.model_manager import ModelManager, LLAMA_AVAILABLE
 from core.paths import resolve_model_path
 from core.token_budget import TokenBudget
+from core.projects import ProjectManager
 from ai.worker import InferenceWorker
 from ui.profile_switcher import ProfileSwitcher
 from ui.settings_dialog import SettingsDialog
@@ -56,6 +57,10 @@ class ZenEditor(QMainWindow):
         # ---------- стейт ----------
         self.pm = ProfileManager()
         self.pm.load()
+
+        # ProjectManager восстанавливает последний проект и делает chdir на него.
+        # Это должно быть ДО _build_ui, чтобы дерево файлов взяло правильный root.
+        self.projects = ProjectManager.instance()
 
         self.app_settings = {
             "use_rag": False,
@@ -103,6 +108,9 @@ class ZenEditor(QMainWindow):
             self._refresh_chat_view(first_active.id)
         self._update_token_bar()
 
+        # Заголовок и статус с именем проекта
+        self._update_window_title()
+
     # ============================================================
     # UI BUILD
     # ============================================================
@@ -143,11 +151,11 @@ class ZenEditor(QMainWindow):
 
         # Файловое дерево
         self.file_model = QFileSystemModel()
-        self.file_model.setRootPath(os.getcwd())
+        self.file_model.setRootPath(self.projects.current)
 
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.file_model)
-        self.tree_view.setRootIndex(self.file_model.index(os.getcwd()))
+        self.tree_view.setRootIndex(self.file_model.index(self.projects.current))
         self.tree_view.hideColumn(1)
         self.tree_view.hideColumn(2)
         self.tree_view.hideColumn(3)
@@ -172,10 +180,18 @@ class ZenEditor(QMainWindow):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
-        self.toggle_btn = QPushButton("☰ Проект")
+        self.toggle_btn = QPushButton("☰ Дерево")
         self.toggle_btn.setObjectName("secondary")
+        self.toggle_btn.setToolTip("Показать / скрыть дерево файлов")
         self.toggle_btn.clicked.connect(self.toggle_sidebar)
         top_bar.addWidget(self.toggle_btn)
+
+        # Кнопка проекта с выпадающим меню "Недавние"
+        self.project_btn = QPushButton("📁 Проект")
+        self.project_btn.setObjectName("secondary")
+        self.project_btn.setToolTip("Открыть другой проект (Ctrl+Shift+O)\nКлик — меню недавних")
+        self.project_btn.clicked.connect(self._show_project_menu)
+        top_bar.addWidget(self.project_btn)
 
         self.save_btn = QPushButton("💾 Сохранить")
         self.save_btn.setObjectName("secondary")
@@ -222,8 +238,9 @@ class ZenEditor(QMainWindow):
         status_row.addWidget(self.token_bar)
         layout.addLayout(status_row)
 
-        # --- ШОРТКАТ ---
+        # --- ШОРТКАТЫ ---
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.save_file)
+        QShortcut(QKeySequence("Ctrl+Shift+O"), self).activated.connect(self.open_project_dialog)
 
         # --- WORK SPLITTER ---
         self.work_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -345,6 +362,8 @@ class ZenEditor(QMainWindow):
             self.chat_input.setPlaceholderText("Запрос к кодеру (Enter)")
         elif profile.kind == ProfileKind.COMPANION:
             self.chat_input.setPlaceholderText(f"Написать {profile.name}... (Enter)")
+        elif profile.kind == ProfileKind.VISION:
+            self.chat_input.setPlaceholderText("Опишите, что хотите узнать о картинке (Enter)")
         else:
             self.chat_input.setPlaceholderText("Сообщение... (Enter)")
 
@@ -423,6 +442,37 @@ class ZenEditor(QMainWindow):
             self._append_chat_active("<b style='color:#CE9178;'>Не выбрана модель в Настройках</b><br>")
             return
 
+        # Проверка: есть ли картинки и подходит ли профиль
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+        has_images = any(
+            os.path.splitext(p)[1].lower() in image_exts
+            for p in self.attached_files
+        )
+        if has_images and profile.kind != ProfileKind.VISION:
+            # ищем Vision-профиль
+            vision_profiles = self.pm.by_kind(ProfileKind.VISION)
+            ready_vision = next(
+                (p for p in vision_profiles if p.model_file and p.mmproj_file),
+                None,
+            )
+            if ready_vision:
+                btn = QMessageBox.question(
+                    self, "Прикреплена картинка",
+                    f"Активный профиль «{profile.name}» не понимает изображения.\n"
+                    f"Переключиться на Vision-профиль «{ready_vision.name}»?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if btn == QMessageBox.StandardButton.Yes:
+                    self.profile_switcher.set_active(ready_vision.id)
+                    self._on_profile_changed(ready_vision.id)
+                    profile = ready_vision
+            else:
+                self._append_chat_active(
+                    "<i style='color:#CE9178;'>⚠ Прикреплены картинки, но нет настроенного Vision-профиля. "
+                    "Создайте профиль типа Vision в Настройках и выберите файл модели + mmproj.</i><br>"
+                )
+
         # --- ОБРАБОТКА ВЛОЖЕНИЙ ---
         attachment_text = ""
         attached_paths = list(self.attached_files) 
@@ -455,7 +505,7 @@ class ZenEditor(QMainWindow):
         rag_snippets = ""
         if profile.kind == ProfileKind.CODER:
             # 1. Добавляем структуру проекта
-            tree_context = self._get_project_tree(os.getcwd())
+            tree_context = self._get_project_tree(self.projects.current)
             
             # 2. Добавляем открытый файл (если он не пуст)
             active_file_text = self._get_editor_text().strip()
@@ -655,7 +705,9 @@ class ZenEditor(QMainWindow):
 
     def save_file(self) -> None:
         if not self.current_file_path:
-            path, _ = QFileDialog.getSaveFileName(self, "Сохранить как", "", "Все файлы (*.*)")
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить как", self.projects.current, "Все файлы (*.*)"
+            )
             if not path:
                 return
             self.current_file_path = path
@@ -680,7 +732,9 @@ class ZenEditor(QMainWindow):
         self.sandbox.run_code_file(self.current_file_path)
 
     def attach_file(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы", "", "Все файлы (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Прикрепить файлы", self.projects.current, "Все файлы (*.*)"
+        )
         if not paths:
             return
         for p in paths:
@@ -725,7 +779,7 @@ class ZenEditor(QMainWindow):
             return
         self.index_btn.setEnabled(False)
         self.rag_status_label.setText("RAG: индексация...")
-        self._rag_worker = RagIndexWorker(self.rag, os.getcwd())
+        self._rag_worker = RagIndexWorker(self.rag, self.projects.current)
         self._rag_worker.finished_signal.connect(self._on_rag_indexed)
         self._rag_worker.error_signal.connect(self._on_rag_error)
         self._rag_worker.start()
@@ -746,6 +800,167 @@ class ZenEditor(QMainWindow):
     # ============================================================
     # НАСТРОЙКИ / СИДБАР / БЮДЖЕТ
     # ============================================================
+
+    # ---------- ПРОЕКТЫ ----------
+
+    def _show_project_menu(self) -> None:
+        """Меню при клике на кнопку '📁 Проект': открыть + список недавних."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #252526;
+                color: #D4D4D4;
+                border: 1px solid #3A3A3A;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 24px 6px 16px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background: #0E639C;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3A3A3A;
+                margin: 4px 8px;
+            }
+        """)
+
+        open_act = QAction("📂 Открыть папку...", self)
+        open_act.setShortcut("Ctrl+Shift+O")
+        open_act.triggered.connect(self.open_project_dialog)
+        menu.addAction(open_act)
+
+        # Текущий — для информации
+        current_label = f"  📍 Сейчас: {self.projects.current_name}"
+        current_act = QAction(current_label, self)
+        current_act.setEnabled(False)
+        menu.addAction(current_act)
+
+        recent = self.projects.recent()
+        if recent:
+            menu.addSeparator()
+            header = QAction("Недавние:", self)
+            header.setEnabled(False)
+            menu.addAction(header)
+
+            for path in recent[:8]:
+                name = os.path.basename(os.path.normpath(path)) or path
+                short_path = self._shorten_path(path, 50)
+                act = QAction(f"  {name}", self)
+                act.setToolTip(short_path)
+                act.triggered.connect(lambda _, p=path: self._switch_project(p))
+                menu.addAction(act)
+
+        # показываем под кнопкой
+        pos = self.project_btn.mapToGlobal(self.project_btn.rect().bottomLeft())
+        menu.exec(pos)
+
+    def open_project_dialog(self) -> None:
+        """Диалог выбора папки."""
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Открыть проект",
+            self.projects.current,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
+        )
+        if path:
+            self._switch_project(path)
+
+    def _switch_project(self, new_path: str) -> None:
+        """Переключение на другой проект. Спрашивает про несохранённые изменения."""
+        # Несохранённые правки в редакторе — спрашиваем
+        if self._editor_has_unsaved_changes():
+            btn = QMessageBox.question(
+                self, "Несохранённые изменения",
+                "В редакторе есть несохранённый текст. Сохранить перед переключением?",
+                (QMessageBox.StandardButton.Save
+                 | QMessageBox.StandardButton.Discard
+                 | QMessageBox.StandardButton.Cancel),
+                QMessageBox.StandardButton.Save,
+            )
+            if btn == QMessageBox.StandardButton.Cancel:
+                return
+            if btn == QMessageBox.StandardButton.Save:
+                self.save_file()
+
+        if not self.projects.open(new_path):
+            self._append_chat_active(
+                f"<i style='color:#CE9178;'>Не удалось открыть проект: {self._escape(new_path)}</i><br>"
+            )
+            return
+
+        # Перенастраиваем дерево файлов
+        self.file_model.setRootPath(self.projects.current)
+        self.tree_view.setRootIndex(self.file_model.index(self.projects.current))
+
+        # Терминал — новый cwd
+        self.sandbox.set_cwd(self.projects.current)
+
+        # Закрываем открытый файл, если он не из нового проекта
+        if self.current_file_path:
+            try:
+                rel = os.path.relpath(self.current_file_path, self.projects.current)
+                # если путь начинается с '..' — файл вне проекта
+                if rel.startswith(".."):
+                    self._set_editor_text("")
+                    self.current_file_path = ""
+            except ValueError:
+                # разные диски на Windows — точно вне проекта
+                self._set_editor_text("")
+                self.current_file_path = ""
+
+        # RAG-индекс старого проекта не подходит для нового
+        self.rag = ProjectRAG()
+        self._rag_chunks = 0
+        # пробуем подхватить индекс нового проекта, если он раньше индексировался
+        loaded = self.rag.load_index()
+        if loaded > 0:
+            self._rag_chunks = loaded
+            self.rag_status_label.setText(f"RAG: {loaded} чанков (кэш)")
+        else:
+            self.rag_status_label.setText("RAG: – (новый проект)")
+
+        # Заголовок окна
+        self._update_window_title()
+
+        # Подсказка в чате
+        self._append_chat_active(
+            f"<i style='color:#4EC9B0;'>📁 Проект: {self._escape(self.projects.current_name)} "
+            f"<span style='color:#888;'>({self._escape(self.projects.current)})</span></i><br>"
+        )
+
+    def _editor_has_unsaved_changes(self) -> bool:
+        """
+        Быстрая эвристика: если в редакторе есть текст и нет открытого файла —
+        точно несохранённый. Точное отслеживание dirty-флага потребовало бы
+        отдельной логики, пока обходимся этим.
+        """
+        text = self._get_editor_text().strip()
+        if not text:
+            return False
+        if not self.current_file_path:
+            return True
+        # если есть открытый файл — сравниваем содержимое с тем что на диске
+        try:
+            with open(self.current_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                on_disk = f.read()
+            return on_disk != self._get_editor_text()
+        except Exception:
+            return False
+
+    def _update_window_title(self) -> None:
+        name = self.projects.current_name
+        self.setWindowTitle(f"Zen AI Editor — {name}")
+
+    @staticmethod
+    def _shorten_path(path: str, max_len: int = 50) -> str:
+        if len(path) <= max_len:
+            return path
+        return "…" + path[-(max_len - 1):]
+
+    # ---------- НАСТРОЙКИ И ОСТАЛЬНОЕ ----------
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self.pm, self.app_settings, parent=self)

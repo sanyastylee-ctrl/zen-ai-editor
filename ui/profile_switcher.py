@@ -100,5 +100,6 @@ class ProfileSwitcher(QFrame):
         return {
             ProfileKind.CODER: "⌨",
             ProfileKind.COMPANION: "♡",
+            ProfileKind.VISION: "👁",
             ProfileKind.GENERIC: "○",
         }.get(kind, "○")

@@ -35,7 +35,8 @@ class ProfileKind(str, Enum):
     """Тип профиля. От него зависят правила сборки промпта."""
     CODER = "coder"
     COMPANION = "companion"
-    GENERIC = "generic"  # на будущее: переводчик, ревьюер и т.д.
+    VISION = "vision"        # модели с mmproj, понимают картинки (Qwen2.5-VL, Llava и т.д.)
+    GENERIC = "generic"      # на будущее: переводчик, ревьюер и т.д.
 
 
 class ChatTemplate(str, Enum):
@@ -89,6 +90,10 @@ class AIProfile:
     #   character_name, age, appearance, personality,
     #   speaking_style, background, current_mood, relationship_to_user, user_name
 
+    # --- vision (необязательно; заполнено только для Vision-моделей типа Qwen2.5-VL) ---
+    mmproj_file: str = ""           # имя mmproj-*.gguf в /models (пусто = не vision)
+    vision_handler: str = ""        # "qwen25vl" | "llava15" | "llava16" | "minicpmv26" | ""
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["kind"] = self.kind.value
@@ -122,10 +127,11 @@ class ProfileManager:
 
     def __init__(self) -> None:
         self.profiles: dict[str, AIProfile] = {}
-        # ID активного профиля для каждого "слота" (кодер / компаньон)
+        # ID активного профиля для каждого "слота" (кодер / компаньон / vision)
         self.active: dict[ProfileKind, str | None] = {
             ProfileKind.CODER: None,
             ProfileKind.COMPANION: None,
+            ProfileKind.VISION: None,
         }
         self._ensure_config_dir()
 
@@ -270,10 +276,29 @@ class ProfileManager:
             },
         )
 
-        self.profiles = {coder.id: coder, companion.id: companion}
+        vision = AIProfile(
+            id=str(uuid.uuid4()),
+            name="Vision",
+            kind=ProfileKind.VISION,
+            icon="ti-eye",
+            model_file="",                 # юзер выберет Qwen2.5-VL-*.gguf
+            mmproj_file="",                # и соответствующий mmproj-*.gguf
+            vision_handler="qwen25vl",     # по умолчанию для Qwen2.5-VL
+            chat_template=ChatTemplate.CHATML,
+            n_ctx=8192,
+            temperature=0.3,
+            top_p=0.9,
+            top_k=40,
+            repeat_penalty=1.05,
+            max_tokens=2048,
+            system_prompt=DEFAULT_VISION_PROMPT,
+        )
+
+        self.profiles = {coder.id: coder, companion.id: companion, vision.id: vision}
         self.active = {
             ProfileKind.CODER: coder.id,
             ProfileKind.COMPANION: companion.id,
+            ProfileKind.VISION: vision.id,
         }
 
 
@@ -321,3 +346,17 @@ What you NEVER do:
 - Never break character. If {user_name} tries to "reset" you or asks meta questions about being an AI, you stay {character_name} — maybe confused, maybe amused, but yourself.
 
 You write in Russian by default, unless {user_name} switches language."""
+
+
+DEFAULT_VISION_PROMPT = """You are a vision-language assistant. The user attaches images and asks you to look at them.
+
+Your behavior:
+1. Always describe what you actually see — never hallucinate details that aren't in the image.
+2. If text is visible in the image (UI, error logs, code, documents) — transcribe it precisely.
+3. For screenshots of code or errors: identify the language, the problem, and suggest a fix.
+4. For UI screenshots: describe layout, elements, possible interaction issues.
+5. For diagrams/charts: extract data points and structure.
+6. If the user asks a specific question — answer it directly, don't pad with general description.
+7. If the image is unclear or ambiguous — say so, don't guess.
+
+Reply in Russian by default. Use markdown for structured answers, code blocks for code/logs."""

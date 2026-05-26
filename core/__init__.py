@@ -2,6 +2,7 @@ from .profiles import AIProfile, ProfileKind, ProfileManager, ChatTemplate
 from .model_manager import ModelManager, LLAMA_AVAILABLE
 from .token_budget import TokenBudget
 from .chat_templates import format_prompt, detect_template, render_persona
+from .projects import ProjectManager
 
 __all__ = [
     "AIProfile",
@@ -14,4 +15,5 @@ __all__ = [
     "format_prompt",
     "detect_template",
     "render_persona",
+    "ProjectManager",
 ]

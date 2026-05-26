@@ -42,6 +42,22 @@ PROMPT_PRESETS_COMPANION = {
     "Близкая девушка (без цензуры)": None,  # = дефолтный, он уже про девушку
 }
 
+PROMPT_PRESETS_VISION = {
+    "По умолчанию (Vision-ассистент)": "default",
+    "Транскрипция текста с изображения": """You are an OCR assistant. Your only job is to extract text from the image exactly as it appears, preserving line breaks and structure. Do not interpret, summarize, or comment — only transcribe. Reply with the transcribed text in a code block.""",
+    "Анализ скриншота с кодом": """You are a code review assistant looking at screenshots. For each image:
+1. Identify the programming language.
+2. Transcribe the visible code into a markdown code block.
+3. Point out bugs, issues, or improvements you can see.
+Reply in Russian.""",
+    "Анализ UI / интерфейса": """You analyze UI screenshots. Describe:
+- Layout structure (header, sidebar, main area)
+- Interactive elements (buttons, inputs, menus)
+- Visual issues (alignment, contrast, hierarchy)
+- Suggested improvements
+Be concrete, reference what you actually see. Reply in Russian.""",
+}
+
 
 class ProfileEditor(QWidget):
     """Виджет редактора. Сам не показывает кнопки Save/Cancel — это делает диалог-обёртка."""
@@ -78,6 +94,14 @@ class ProfileEditor(QWidget):
 
         if p.kind == ProfileKind.COMPANION and self.persona_editor is not None:
             p.persona = self.persona_editor.get_persona()
+
+        if p.kind == ProfileKind.VISION:
+            if hasattr(self, "mmproj_combo"):
+                value = self.mmproj_combo.currentText()
+                # игнорируем плейсхолдеры типа "(нет mmproj в models/)"
+                p.mmproj_file = value if value and not value.startswith("(") else ""
+            if hasattr(self, "vision_handler_combo"):
+                p.vision_handler = self.vision_handler_combo.currentData() or ""
 
         return p
 
@@ -178,6 +202,59 @@ class ProfileEditor(QWidget):
         hint.setStyleSheet("color:#888; font-size:11px; padding:4px;")
         form.addRow("", hint)
 
+        # === Vision-секция (только для Vision-профилей) ===
+        if self._profile.kind == ProfileKind.VISION:
+            # разделитель
+            sep_label = QLabel("Vision (распознавание изображений)")
+            sep_label.setStyleSheet(
+                "color:#4EC9B0; font-size:11px; font-weight:bold; "
+                "padding:8px 0 4px 0; border-top:1px solid #3A3A3A; margin-top:8px;"
+            )
+            form.addRow(sep_label)
+
+            # mmproj файл
+            mmproj_row = QHBoxLayout()
+            self.mmproj_combo = QComboBox()
+            self.mmproj_combo.setMinimumWidth(280)
+            self._refresh_mmproj_list()
+            mmproj_row.addWidget(self.mmproj_combo, 1)
+
+            mmproj_refresh = QPushButton("⟳")
+            mmproj_refresh.setFixedWidth(34)
+            mmproj_refresh.setObjectName("secondary")
+            mmproj_refresh.setToolTip("Обновить список mmproj файлов")
+            mmproj_refresh.clicked.connect(self._refresh_mmproj_list)
+            mmproj_row.addWidget(mmproj_refresh)
+            form.addRow("mmproj файл:", self._wrap_row(mmproj_row))
+
+            # тип handler'а
+            self.vision_handler_combo = QComboBox()
+            from core.model_manager import available_vision_handlers
+            available = available_vision_handlers()
+            handler_labels = {
+                "qwen25vl": "Qwen 2.5 VL (рекомендуется для Qwen2.5-VL)",
+                "llava15": "LLaVA 1.5",
+                "llava16": "LLaVA 1.6",
+                "minicpmv26": "MiniCPM-V 2.6",
+            }
+            if not available:
+                self.vision_handler_combo.addItem("(в установленной llama-cpp нет vision)", "")
+                self.vision_handler_combo.setEnabled(False)
+            else:
+                for handler_id in available:
+                    label = handler_labels.get(handler_id, handler_id)
+                    self.vision_handler_combo.addItem(label, handler_id)
+            form.addRow("Vision handler:", self.vision_handler_combo)
+
+            vhint = QLabel(
+                "Для <b>Qwen2.5-VL</b>: выберите модель Qwen2.5-VL и её mmproj-f16.gguf, "
+                "handler <b>Qwen 2.5 VL</b>. mmproj должен быть от <b>той же</b> модели."
+            )
+            vhint.setWordWrap(True)
+            vhint.setTextFormat(Qt.TextFormat.RichText)
+            vhint.setStyleSheet("color:#888; font-size:11px; padding:4px;")
+            form.addRow("", vhint)
+
         return w
 
     def _build_prompt_tab(self) -> QWidget:
@@ -193,10 +270,12 @@ class ProfileEditor(QWidget):
         preset_row.addWidget(preset_label)
 
         self.preset_combo = QComboBox()
-        presets = (
-            PROMPT_PRESETS_CODER if self._profile.kind == ProfileKind.CODER
-            else PROMPT_PRESETS_COMPANION
-        )
+        if self._profile.kind == ProfileKind.CODER:
+            presets = PROMPT_PRESETS_CODER
+        elif self._profile.kind == ProfileKind.VISION:
+            presets = PROMPT_PRESETS_VISION
+        else:
+            presets = PROMPT_PRESETS_COMPANION
         self.preset_combo.addItem("— не менять —", None)
         for name, value in presets.items():
             self.preset_combo.addItem(name, value)
@@ -321,10 +400,23 @@ class ProfileEditor(QWidget):
         if self.persona_editor is not None:
             self.persona_editor.set_persona(p.persona)
 
+        # Vision-поля
+        if p.kind == ProfileKind.VISION and hasattr(self, "mmproj_combo"):
+            if p.mmproj_file and self.mmproj_combo.findText(p.mmproj_file) == -1:
+                self.mmproj_combo.addItem(p.mmproj_file)
+            if p.mmproj_file:
+                self.mmproj_combo.setCurrentText(p.mmproj_file)
+            if hasattr(self, "vision_handler_combo") and p.vision_handler:
+                idx = self.vision_handler_combo.findData(p.vision_handler)
+                if idx >= 0:
+                    self.vision_handler_combo.setCurrentIndex(idx)
+
     def _refresh_models(self) -> None:
         current = self.model_combo.currentText() if self.model_combo.count() else ""
         self.model_combo.clear()
         models = list_available_models()
+        # отфильтруем mmproj-файлы — они не основные модели
+        models = [m for m in models if "mmproj" not in m.lower()]
         if not models:
             self.model_combo.addItem("(нет .gguf в папке models/)")
             self.model_combo.setEnabled(False)
@@ -334,6 +426,24 @@ class ProfileEditor(QWidget):
                 self.model_combo.addItem(m)
             if current and current in models:
                 self.model_combo.setCurrentText(current)
+
+    def _refresh_mmproj_list(self) -> None:
+        if not hasattr(self, "mmproj_combo"):
+            return
+        current = self.mmproj_combo.currentText() if self.mmproj_combo.count() else ""
+        self.mmproj_combo.clear()
+        all_models = list_available_models()
+        # mmproj-файлы — те, где в имени есть mmproj
+        mmprojs = [m for m in all_models if "mmproj" in m.lower()]
+        if not mmprojs:
+            self.mmproj_combo.addItem("(нет mmproj-*.gguf в models/)")
+            self.mmproj_combo.setEnabled(False)
+        else:
+            self.mmproj_combo.setEnabled(True)
+            for m in mmprojs:
+                self.mmproj_combo.addItem(m)
+            if current and current in mmprojs:
+                self.mmproj_combo.setCurrentText(current)
 
     def _browse_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -350,10 +460,16 @@ class ProfileEditor(QWidget):
         if value is None:
             return  # "не менять"
 
-        from core.profiles import DEFAULT_CODER_PROMPT, DEFAULT_COMPANION_PROMPT
+        from core.profiles import (
+            DEFAULT_CODER_PROMPT, DEFAULT_COMPANION_PROMPT, DEFAULT_VISION_PROMPT,
+        )
         if value == "default":
-            text = (DEFAULT_CODER_PROMPT if self._profile.kind == ProfileKind.CODER
-                    else DEFAULT_COMPANION_PROMPT)
+            if self._profile.kind == ProfileKind.CODER:
+                text = DEFAULT_CODER_PROMPT
+            elif self._profile.kind == ProfileKind.VISION:
+                text = DEFAULT_VISION_PROMPT
+            else:
+                text = DEFAULT_COMPANION_PROMPT
         else:
             text = value
 
@@ -381,6 +497,7 @@ class ProfileEditor(QWidget):
         return {
             ProfileKind.CODER: "тип: кодер",
             ProfileKind.COMPANION: "тип: компаньон",
+            ProfileKind.VISION: "тип: vision (изображения)",
             ProfileKind.GENERIC: "тип: общий",
         }.get(self._profile.kind, "")
 

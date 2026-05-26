@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 
 from core.profiles import (
     AIProfile, ProfileKind, ProfileManager, ChatTemplate,
-    DEFAULT_CODER_PROMPT, DEFAULT_COMPANION_PROMPT,
+    DEFAULT_CODER_PROMPT, DEFAULT_COMPANION_PROMPT, DEFAULT_VISION_PROMPT,
 )
 from .profile_editor import ProfileEditor
 
@@ -194,6 +194,7 @@ class SettingsDialog(QDialog):
         icon = {
             ProfileKind.CODER: "⌨",
             ProfileKind.COMPANION: "♡",
+            ProfileKind.VISION: "👁",
             ProfileKind.GENERIC: "○",
         }.get(profile.kind, "○")
         return f"{icon}  {profile.name}"
@@ -212,6 +213,7 @@ class SettingsDialog(QDialog):
         kinds = {
             "Компаньон (живой персонаж)": ProfileKind.COMPANION,
             "Кодер": ProfileKind.CODER,
+            "Vision (изображения)": ProfileKind.VISION,
             "Общий": ProfileKind.GENERIC,
         }
         kind_label, ok = QInputDialog.getItem(
@@ -237,6 +239,12 @@ class SettingsDialog(QDialog):
                 temperature=0.85, top_p=0.95, top_k=50,
                 repeat_penalty=1.15, max_tokens=1024, n_ctx=8192,
                 persona={"character_name": name.strip(), "user_name": "", "current_mood": "спокойное"},
+            ),
+            ProfileKind.VISION: dict(
+                system_prompt=DEFAULT_VISION_PROMPT,
+                temperature=0.3, top_p=0.9, top_k=40,
+                repeat_penalty=1.05, max_tokens=2048, n_ctx=8192,
+                vision_handler="qwen25vl",
             ),
             ProfileKind.GENERIC: dict(
                 system_prompt="You are a helpful assistant.",
