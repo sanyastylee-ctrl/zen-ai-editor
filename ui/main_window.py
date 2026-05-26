@@ -24,7 +24,7 @@ from PyQt6.QtGui import QFileSystemModel, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QFrame, QTreeView, QTabWidget,
-    QLabel, QProgressBar, QFileDialog, QMessageBox,
+    QLabel, QProgressBar, QFileDialog, QMessageBox, QMenu
 )
 
 from core.profiles import ProfileManager, ProfileKind, AIProfile
@@ -153,6 +153,11 @@ class ZenEditor(QMainWindow):
         self.tree_view.hideColumn(3)
         self.tree_view.setHeaderHidden(True)
         self.tree_view.doubleClicked.connect(self.open_file)
+        
+        # Включаем контекстное меню для прикрепления файлов из дерева
+        self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_view.customContextMenuRequested.connect(self._on_tree_context_menu)
+        
         layout.addWidget(self.tree_view)
 
         return self.sidebar
@@ -348,8 +353,42 @@ class ZenEditor(QMainWindow):
         return self.pm.get(pid) if pid else None
 
     # ============================================================
-    # ЧАТ
+    # ЧАТ И КОНТЕКСТ
     # ============================================================
+
+    def _get_project_tree(self, root_dir: str, max_depth: int = 2) -> str:
+        """Создает текстовую карту проекта для ИИ (игнорирует мусор)."""
+        tree_str = "📂 Структура проекта (карта файлов):\n"
+        ignore_dirs = {
+            "__pycache__", "venv", "env", ".venv", "node_modules", 
+            "build", "dist", ".git", ".idea", ".zen_ai"
+        }
+        
+        def walk(dir_path: str, prefix: str = "", depth: int = 0) -> str:
+            if depth > max_depth:
+                return prefix + "└── ...\n"
+            res = ""
+            try:
+                items = sorted(os.listdir(dir_path))
+            except Exception:
+                return res
+            
+            # Отфильтровываем скрытые файлы и мусорные папки
+            items = [item for item in items if not item.startswith('.') and item not in ignore_dirs]
+            
+            for i, item in enumerate(items):
+                path = os.path.join(dir_path, item)
+                is_last = (i == len(items) - 1)
+                pointer = "└── " if is_last else "├── "
+                res += prefix + pointer + item + "\n"
+                
+                if os.path.isdir(path):
+                    extension = "    " if is_last else "│   "
+                    res += walk(path, prefix + extension, depth + 1)
+            return res
+
+        tree = walk(root_dir)
+        return tree_str + tree if tree else ""
 
     def _refresh_chat_view(self, profile_id: str) -> None:
         self.chat_history.setHtml(self._chat_html.get(profile_id, ""))
@@ -368,8 +407,10 @@ class ZenEditor(QMainWindow):
 
     def send_message(self) -> None:
         text = self.chat_input.text().strip()
-        if not text:
+        
+        if not text and not self.attached_files:
             return
+            
         if not LLAMA_AVAILABLE:
             self._append_chat_active("<b style='color:#CE9178;'>llama-cpp-python не установлен</b><br>")
             return
@@ -382,38 +423,74 @@ class ZenEditor(QMainWindow):
             self._append_chat_active("<b style='color:#CE9178;'>Не выбрана модель в Настройках</b><br>")
             return
 
-        # рендерим юзер-сообщение
-        user_html = f"<div style='margin:6px 0; color:#9CDCFE;'><b>Ты:</b> {self._escape(text)}</div>"
+        # --- ОБРАБОТКА ВЛОЖЕНИЙ ---
+        attachment_text = ""
+        attached_paths = list(self.attached_files) 
+        
+        if self.attached_files:
+            attachment_text = self._load_attached_files()
+            self.attached_files = []
+            self._update_attached_label()
+
+        full_text = text
+        if attachment_text and profile.kind == ProfileKind.COMPANION:
+            full_text = f"Вложенные файлы:\n{attachment_text}\n\n{text}".strip()
+
+        # Рендерим юзер-сообщение (с жесткими переносами <br>)
+        safe_text = self._escape(text)
+        if attached_paths:
+            file_names = ", ".join(os.path.basename(p) for p in attached_paths)
+            if safe_text:
+                display_html = f"{safe_text}<br><i style='color:#888; font-size:12px;'>📎 Прикреплено: {file_names}</i>"
+            else:
+                display_html = f"<i style='color:#888; font-size:12px;'>📎 Отправлен файл: {file_names}</i>"
+        else:
+            display_html = safe_text
+
+        user_html = f"<span style='color:#9CDCFE;'><b>Ты:</b></span><br><span style='color:#D4D4D4;'>{display_html}</span><br><br>"
         self._append_chat_active(user_html)
 
-        # подготовка контекста
+        # --- ПОДГОТОВКА СВЕРХКОМПЛЕКСНОГО КОНТЕКСТА ---
         code_context = ""
         rag_snippets = ""
         if profile.kind == ProfileKind.CODER:
-            code_context = self._get_editor_text()
-            if self.attached_files:
-                code_context += "\n\n" + self._load_attached_files()
-            if self.app_settings.get("use_rag") and self._rag_chunks > 0:
-                rag_snippets = self.rag.search(text, top_k=5)
+            # 1. Добавляем структуру проекта
+            tree_context = self._get_project_tree(os.getcwd())
+            
+            # 2. Добавляем открытый файл (если он не пуст)
+            active_file_text = self._get_editor_text().strip()
+            active_context = f"📝 Текущий открытый файл в редакторе:\n{active_file_text}" if active_file_text else ""
+            
+            # 3. Собираем итоговый контекст
+            blocks = [tree_context]
+            if attachment_text:
+                blocks.append(attachment_text)
+            if active_context:
+                blocks.append(active_context)
+                
+            code_context = "\n\n".join(filter(bool, blocks))
 
-        # вступление для ответа
+            if self.app_settings.get("use_rag") and self._rag_chunks > 0:
+                rag_snippets = self.rag.search(full_text, top_k=5)
+
+        # Вступление для ответа (с жестким переносом <br>)
         speaker = profile.name if profile.kind == ProfileKind.COMPANION else "Ассистент"
-        self._append_chat_active(f"<div style='margin:6px 0; color:#CE9178;'><b>{speaker}:</b> </div>")
+        self._append_chat_active(f"<span style='color:#CE9178;'><b>{speaker}:</b></span><br>")
         self._current_ai_response = ""
 
-        # история профиля
         history = self._histories.get(profile.id, [])
 
         self.worker = InferenceWorker(
             profile=profile,
-            user_message=text,
+            user_message=full_text,
             code_context=code_context,
             rag_snippets=rag_snippets,
             history=history,
             user_name=profile.persona.get("user_name", "") if profile.kind == ProfileKind.COMPANION else "",
+            attached_files=attached_paths,
         )
         self.worker.chunk_received.connect(self._on_chunk)
-        self.worker.finished_signal.connect(lambda: self._on_generation_done(profile.id, text))
+        self.worker.finished_signal.connect(lambda: self._on_generation_done(profile.id, full_text))
         self.worker.model_loading.connect(lambda p: self.model_status.setText(f"Загружаю {os.path.basename(p)}..."))
         self.worker.model_loaded.connect(
             lambda p, ok, err: self.model_status.setText(
@@ -428,25 +505,24 @@ class ZenEditor(QMainWindow):
 
     def _on_chunk(self, chunk: str) -> None:
         self._current_ai_response += chunk
-        # экранируем HTML, чтобы стрим текст не ломал разметку
-        esc = self._escape(chunk)
         self.chat_history.moveCursor(self.chat_history.textCursor().MoveOperation.End)
-        self.chat_history.insertHtml(esc.replace("\n", "<br>"))
+        self.chat_history.insertPlainText(chunk)
         sb = self.chat_history.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def _on_generation_done(self, profile_id: str, user_msg: str) -> None:
-        # дописываем разделитель в кэш-html
-        end_html = "<br><br>"
+        esc_resp = self._escape(self._current_ai_response).replace("\n", "<br>")
+        # Добавляем жесткие отступы через <br><br> и закрываем тег
+        end_html = f"<span style='color:#D4D4D4;'>{esc_resp}</span><br><br>"
         self._chat_html[profile_id] = self._chat_html.get(profile_id, "") + end_html
+        
         if self.profile_switcher.active_id() == profile_id:
-            self.chat_history.insertHtml(end_html)
+            self.chat_history.moveCursor(self.chat_history.textCursor().MoveOperation.End)
+            self.chat_history.insertHtml("<br><br>")
 
-        # пушим в историю
         hist = self._histories.setdefault(profile_id, [])
         hist.append((user_msg, self._current_ai_response))
 
-        # лимит истории, чтобы не разрасталось бесконечно (бюджет токенов всё равно обрежет)
         if len(hist) > 50:
             del hist[: len(hist) - 50]
 
@@ -477,7 +553,6 @@ class ZenEditor(QMainWindow):
             self.model_status.setText(f"✗ Ошибка: {err}")
 
     def _on_model_evict(self, path: str) -> None:
-        # пользователь увидит "Загружаю..." в следующем _on_model_load_start
         pass
 
     # ============================================================
@@ -485,9 +560,7 @@ class ZenEditor(QMainWindow):
     # ============================================================
 
     def apply_code_from_chat(self) -> None:
-        """Извлекает код из последнего ответа и вставляет в редактор."""
         if not self._current_ai_response:
-            # после finish мы обнуляем response — берём из истории
             pid = self.profile_switcher.active_id()
             if pid and self._histories.get(pid):
                 _, last_response = self._histories[pid][-1]
@@ -496,8 +569,7 @@ class ZenEditor(QMainWindow):
         else:
             last_response = self._current_ai_response
 
-        # ищем код в ```язык ... ``` блоках, либо весь текст если их нет
-        code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", last_response, re.DOTALL)
+        code_blocks = re.findall(r"`{3}(?:\w+)?\n(.*?)`{3}", last_response, re.DOTALL)
         if code_blocks:
             new_code = code_blocks[0].strip()
         else:
@@ -506,7 +578,6 @@ class ZenEditor(QMainWindow):
         old_code = self._get_editor_text()
         has_selection = self._editor_has_selection()
 
-        # diff превью при замене всего файла
         if self.app_settings.get("diff_before_apply", True) and not has_selection and old_code.strip():
             dlg = DiffApplyDialog(old_code, new_code, parent=self)
             if dlg.exec() != dlg.DialogCode.Accepted:
@@ -517,10 +588,6 @@ class ZenEditor(QMainWindow):
             self._replace_selection(new_code)
         else:
             self._set_editor_text(new_code)
-
-    # ============================================================
-    # ФАЙЛЫ И РЕДАКТОР
-    # ============================================================
 
     def _get_editor_text(self) -> str:
         if QSCI_AVAILABLE and hasattr(self.code_editor, "text"):
@@ -544,6 +611,32 @@ class ZenEditor(QMainWindow):
         else:
             cursor = self.code_editor.textCursor()
             cursor.insertText(text)
+
+    # ============================================================
+    # ФАЙЛЫ, ДЕРЕВО И ВЛОЖЕНИЯ
+    # ============================================================
+
+    def _on_tree_context_menu(self, pos) -> None:
+        """Обрабатывает правый клик по файлу в дереве."""
+        index = self.tree_view.indexAt(pos)
+        if not index.isValid():
+            return
+            
+        path = self.file_model.filePath(index)
+        menu = QMenu(self)
+        
+        if os.path.isfile(path):
+            attach_action = menu.addAction("📎 Прикрепить к запросу")
+            open_action = menu.addAction("📝 Открыть в редакторе")
+            
+            action = menu.exec(self.tree_view.viewport().mapToGlobal(pos))
+            
+            if action == attach_action:
+                if path not in self.attached_files:
+                    self.attached_files.append(path)
+                    self._update_attached_label()
+            elif action == open_action:
+                self.open_file(index)
 
     def open_file(self, index) -> None:
         path = self.file_model.filePath(index)
@@ -582,7 +675,6 @@ class ZenEditor(QMainWindow):
         if not self.current_file_path.endswith(".py"):
             self._append_chat_active("<i style='color:#888;'>Запуск поддерживается только для .py файлов.</i><br>")
             return
-        # переключиться на вкладку терминала
         self._editor_tabs.setCurrentIndex(1)
         self.sandbox.set_cwd(os.path.dirname(self.current_file_path))
         self.sandbox.run_code_file(self.current_file_path)
@@ -591,17 +683,32 @@ class ZenEditor(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы", "", "Все файлы (*.*)")
         if not paths:
             return
-        self.attached_files = paths
-        names = ", ".join(os.path.basename(p) for p in paths)
+        for p in paths:
+            if p not in self.attached_files:
+                self.attached_files.append(p)
+        self._update_attached_label()
+
+    def _update_attached_label(self) -> None:
+        """Обновляет текст метки под полем ввода."""
+        if not self.attached_files:
+            self.attached_label.setVisible(False)
+            self.attached_label.setText("")
+            return
+            
+        names = ", ".join(os.path.basename(p) for p in self.attached_files)
         self.attached_label.setText(f"📎 Прикреплено: {names}")
         self.attached_label.setVisible(True)
 
     def _load_attached_files(self) -> str:
         parts = []
+        skip_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.exe', '.zip'}
         for p in self.attached_files:
+            ext = os.path.splitext(p)[1].lower()
+            if ext in skip_exts:
+                continue 
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    parts.append(f"### {os.path.basename(p)}\n{f.read()}")
+                    parts.append(f"### Прикрепленный файл: {os.path.basename(p)}\n{f.read()}")
             except Exception:
                 pass
         return "\n\n".join(parts)
@@ -644,7 +751,6 @@ class ZenEditor(QMainWindow):
         dlg = SettingsDialog(self.pm, self.app_settings, parent=self)
         if dlg.exec() == dlg.DialogCode.Accepted:
             self.app_settings.update(dlg.get_app_settings())
-            # перестроить свитчер (могли добавиться новые профили или удалиться)
             current = self.profile_switcher.active_id()
             profiles = self.pm.all()
             if current and current not in {p.id for p in profiles}:
@@ -736,6 +842,13 @@ class ZenEditor(QMainWindow):
             }
             QTreeView::item:hover { background-color: #2A2D2E; }
             QTreeView::item:selected { background-color: #37373D; }
+            QMenu {
+                background-color: #252526; color: #D4D4D4;
+                border: 1px solid #333;
+            }
+            QMenu::item:selected {
+                background-color: #0E639C;
+            }
             QTabWidget::pane { border: none; background: #1E1E1E; }
             QTabBar::tab {
                 background: #2D2D2D; color: #888;

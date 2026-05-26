@@ -13,15 +13,19 @@ ModelManager — держит одновременно несколько мод
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 try:
     from llama_cpp import Llama
+    # Импортируем обработчик для Vision моделей (проекторов mmproj)
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
     LLAMA_AVAILABLE = True
 except ImportError:
     Llama = None  # type: ignore
+    Llava15ChatHandler = None
     LLAMA_AVAILABLE = False
 
 
@@ -113,11 +117,32 @@ class ModelManager:
 
         # Загрузка вне lock — она долгая, не хотим блокировать остальных
         self._emit(self._on_load_start, path)
+
+        # Подключение модуля зрения (Vision)
+        chat_handler = None
+        if Llava15ChatHandler is not None:
+            model_dir = os.path.dirname(path)
+            if os.path.exists(model_dir):
+                # Ищем любой файл, содержащий "mmproj" (проектор) в той же папке
+                for f in os.listdir(model_dir):
+                    if "mmproj" in f.lower() and f.lower().endswith(".gguf"):
+                        mmproj_path = os.path.join(model_dir, f)
+                        self._emit(self._on_load_start, f"Загрузка модуля зрения (mmproj)...")
+                        try:
+                            # Инициализируем зрение
+                            chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+                        except Exception as e:
+                            print(f"[ModelManager] Ошибка загрузки mmproj: {e}")
+                        break
+
         try:
+            # Передаем chat_handler внутрь Llama. 
+            # Если он None, модель загрузится как обычная текстовая.
             model = Llama(
                 model_path=path,
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers,
+                chat_handler=chat_handler,
                 verbose=False,
             )
         except Exception as e:
