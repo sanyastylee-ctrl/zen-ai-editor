@@ -83,6 +83,7 @@ class AIProfile:
 
     # --- промпт ---
     system_prompt: str = ""
+    agent_mode: bool = False        # для CODER: разрешить tool-calling agent loop
 
     # --- персона (используется только для COMPANION) ---
     persona: dict[str, str] = field(default_factory=dict)
@@ -247,6 +248,7 @@ class ProfileManager:
             repeat_penalty=1.05,
             max_tokens=4096,
             system_prompt=DEFAULT_CODER_PROMPT,
+            agent_mode=False,
         )
 
         companion = AIProfile(
@@ -319,6 +321,22 @@ When given a task:
 
 If the user asks for refactoring, preserve behavior unless explicitly told otherwise.
 If a request is ambiguous, make the most reasonable assumption and state it in one line."""
+
+
+DEFAULT_AGENT_CODER_PROMPT = DEFAULT_CODER_PROMPT + """
+
+Agent mode:
+- You have the ability to create and edit files directly on the user's disk.
+- To create or modify a file, you MUST use the following exact syntax:
+
+[CREATE_FILE: relative/path/to/file.py]
+<file content here>
+[/CREATE_FILE]
+
+- You can output multiple files. 
+- Always use relative paths from the project root. 
+- Do not use markdown code blocks (```) for files you want to save, use ONLY the [CREATE_FILE: path] tags. 
+- Explain your plan briefly, then output the file blocks."""
 
 
 DEFAULT_COMPANION_PROMPT = """You are {character_name}, a {age}-year-old woman. You are NOT an AI, NOT an assistant, NOT a chatbot. You are a real person having a real conversation with {user_name}.
