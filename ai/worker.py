@@ -202,6 +202,9 @@ class InferenceWorker(QThread):
                         "\n<i style='color:#888;'>[прервано: обнаружено зацикливание]</i>"
                     )
                     break
+        
+        # Выполняем действия агента, когда текст сгенерирован полностью
+        self._execute_agent_actions(generated)
 
     # ============================================================
     # Режим 2: chat completion (Vision)
@@ -278,6 +281,195 @@ class InferenceWorker(QThread):
                         "\n<i style='color:#888;'>[прервано: обнаружено зацикливание]</i>"
                     )
                     break
+        
+        # Выполняем действия агента, когда текст сгенерирован полностью
+        self._execute_agent_actions(generated)
+
+    # ============================================================
+    # Логика Агента (парсинг и исполнение)
+    # ============================================================
+
+    def _execute_agent_actions(self, text: str) -> None:
+        """
+        Парсит ответ модели, ищет операции [FILE:], [DELETE:], [RUN:] и исполняет.
+
+        Главная сложность: модель часто забывает закрывающие теги. Парсер должен
+        работать даже когда:
+        - забыт [/FILE] / [/CREATE_FILE]
+        - после [FILE:] модель пишет ```python (новый формат)
+        - после [CREATE_FILE:] модель тоже пишет ```python (старый формат)
+        - модель ставит [FILE:] подряд без разделителей
+
+        Стратегия: ищем маркеры начала, для каждого определяем границу как
+        "первый из": закрывающая ``` после открытия / следующий [FILE:] или
+        [CREATE_FILE:] / явный закрывающий тег / конец текста.
+        """
+        if not getattr(self.profile, "agent_mode", False):
+            return
+
+        actions = self._parse_agent_actions(text)
+        if not actions:
+            return
+
+        base_dir = os.path.abspath(os.getcwd())
+        created: list[str] = []
+        deleted: list[str] = []
+        executed: list[str] = []
+        errors: list[str] = []
+
+        for action in actions:
+            kind = action["kind"]
+
+            if kind == "file":
+                filepath = action["path"]
+                content = action["content"]
+                abs_path = os.path.abspath(os.path.join(base_dir, filepath))
+                if not abs_path.startswith(base_dir + os.sep) and abs_path != base_dir:
+                    errors.append(f"путь вне проекта: {filepath}")
+                    continue
+                try:
+                    parent = os.path.dirname(abs_path)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    with open(abs_path, "w", encoding="utf-8", newline="") as f:
+                        f.write(content)
+                    created.append(filepath)
+                except Exception as e:
+                    errors.append(f"запись {filepath}: {e}")
+
+            elif kind == "delete":
+                filepath = action["path"]
+                abs_path = os.path.abspath(os.path.join(base_dir, filepath))
+                if not abs_path.startswith(base_dir + os.sep):
+                    errors.append(f"путь вне проекта: {filepath}")
+                    continue
+                try:
+                    if os.path.isfile(abs_path):
+                        os.remove(abs_path)
+                        deleted.append(filepath)
+                    else:
+                        errors.append(f"не найден для удаления: {filepath}")
+                except Exception as e:
+                    errors.append(f"удаление {filepath}: {e}")
+
+            elif kind == "run":
+                # Запуск команды через signal в UI — UI решит, исполнять или нет,
+                # покажет результат в терминале и логи. Сам worker не запускает
+                # подпроцессы (это не его ответственность).
+                cmd = action["command"]
+                self.chunk_received.emit(
+                    f"<br><span style='color:#569CD6;'>[🤖 предлагает выполнить: <code>{self._escape_html(cmd)}</code>]</span><br>"
+                )
+                executed.append(cmd)
+
+        # Итоговый отчёт в чат
+        if created:
+            self.chunk_received.emit(
+                f"<br><i style='color:#4EC9B0;'>✓ Создано/перезаписано: {', '.join(created)}</i><br>"
+            )
+        if deleted:
+            self.chunk_received.emit(
+                f"<br><i style='color:#CDA040;'>✓ Удалено: {', '.join(deleted)}</i><br>"
+            )
+        if errors:
+            for err in errors:
+                self.chunk_received.emit(
+                    f"<br><b style='color:#CE4040;'>✗ {self._escape_html(err)}</b>"
+                )
+            self.chunk_received.emit("<br>")
+
+    def _parse_agent_actions(self, text: str) -> list[dict]:
+        """
+        Возвращает список действий в порядке их появления в тексте.
+        Каждое действие — dict с полем 'kind' и доп.полями:
+          - kind="file":   path, content
+          - kind="delete": path
+          - kind="run":    command
+        """
+        actions: list[dict] = []
+
+        # Все стартовые маркеры в порядке появления в тексте.
+        # Поддерживаем оба синтаксиса — новый [FILE:] и старый [CREATE_FILE:].
+        marker_iter = re.finditer(
+            r"\[(FILE|CREATE_FILE|DELETE|RUN):\s*([^\]\n]+?)\s*\]",
+            text,
+            re.IGNORECASE,
+        )
+        markers = [(m.start(), m.end(), m.group(1).upper(), m.group(2).strip())
+                   for m in marker_iter]
+        if not markers:
+            return []
+
+        for idx, (start, after_marker, kind, value) in enumerate(markers):
+            # Где этот блок заканчивается? — до следующего маркера или до конца текста.
+            next_start = markers[idx + 1][0] if idx + 1 < len(markers) else len(text)
+            block_text = text[after_marker:next_start]
+
+            if kind in ("FILE", "CREATE_FILE"):
+                content = InferenceWorker._extract_file_content(block_text)
+                if content is None:
+                    # совсем не нашли содержимое — пропускаем
+                    continue
+                actions.append({
+                    "kind": "file",
+                    "path": value,
+                    "content": content,
+                })
+
+            elif kind == "DELETE":
+                actions.append({
+                    "kind": "delete",
+                    "path": value,
+                })
+
+            elif kind == "RUN":
+                # Команда у нас в самом маркере (value). Но если кто-то решил
+                # написать её в код-блоке после маркера — тоже подхватим.
+                cmd = value
+                fenced = InferenceWorker._extract_file_content(block_text)
+                if fenced and not cmd:
+                    cmd = fenced.strip()
+                if cmd:
+                    actions.append({"kind": "run", "command": cmd})
+
+        return actions
+
+    @staticmethod
+    def _extract_file_content(block_text: str) -> str | None:
+        """
+        Достаёт содержимое файла из блока, идущего сразу после [FILE:] / [CREATE_FILE:].
+
+        Поддержка разных вариантов написания:
+          1. ```python\n...\n```           — идеальный случай
+          2. ```\n...\n```                  — без указания языка
+          3. ```python\n...   (нет закрывающей) — берём всё до конца блока
+          4. ```python\n...\n```\n[/CREATE_FILE]  — старый формат, тэг игнорим
+          5. ...текст без кавычек...        — берём как есть (последний шанс)
+        """
+        # 1+2+4: пара тройных кавычек
+        m = re.search(r"```[a-zA-Z0-9_+\-]*\n(.*?)```", block_text, re.DOTALL)
+        if m:
+            return m.group(1)
+
+        # 3: открывающие кавычки есть, закрывающих нет — берём до конца блока
+        m = re.search(r"```[a-zA-Z0-9_+\-]*\n(.*)", block_text, re.DOTALL)
+        if m:
+            # обрезаем хвостовой [/CREATE_FILE] или [/FILE] если случайно влез
+            content = m.group(1)
+            content = re.sub(r"\[/(?:CREATE_)?FILE\]\s*$", "", content, flags=re.IGNORECASE).rstrip()
+            return content
+
+        # 5: тройных кавычек нет вообще — модель написала контент сырым
+        cleaned = re.sub(r"\[/(?:CREATE_)?FILE\]\s*$", "", block_text, flags=re.IGNORECASE).strip()
+        if cleaned:
+            return cleaned
+        return None
+
+    @staticmethod
+    def _escape_html(s: str) -> str:
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;"))
 
     # ============================================================
     # Утилиты

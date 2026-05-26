@@ -63,6 +63,39 @@ def _prepare(
         system = render_persona(profile.system_prompt, profile.persona, user_name)
     else:
         system = profile.system_prompt
+        
+    # Внедрение правил создания файлов, если включен Agent Mode.
+    # Формат намеренно использует тройные кавычки как закрытие блока — модель
+    # органически закрывает их (Qwen-Coder натренирован на этом), и нам не нужно
+    # надеяться, что она вспомнит про закрывающий тег.
+    if getattr(profile, "agent_mode", False) and profile.kind == ProfileKind.CODER:
+        agent_instructions = (
+            "\n\n=== AGENT MODE ===\n"
+            "You can create, edit, delete files and run terminal commands in the user's project.\n"
+            "Use ONLY these exact formats. Do NOT invent variations.\n\n"
+            "## Create or overwrite a file\n"
+            "Write the marker, then the code inside a fenced code block. "
+            "The closing ``` is what ends the operation — there is no closing marker.\n\n"
+            "[FILE: path/to/file.py]\n"
+            "```python\n"
+            "def hello():\n"
+            "    print('hi')\n"
+            "```\n\n"
+            "## Delete a file\n"
+            "[DELETE: path/to/file.py]\n\n"
+            "## Run a shell command\n"
+            "[RUN: pytest tests/ -v]\n\n"
+            "## Rules\n"
+            "- Always use RELATIVE paths from the project root.\n"
+            "- ONE file per [FILE:] marker. To create N files, write N markers.\n"
+            "- Always specify the language after ``` (```python, ```javascript, ```html, etc).\n"
+            "- Put a blank line between operation blocks.\n"
+            "- Briefly explain your plan in plain text BEFORE the operation blocks.\n"
+            "- After operations, you can summarize what you did.\n"
+            "- Do NOT wrap explanations or summaries in [FILE:] markers — those are only for files to be saved.\n"
+        )
+        if "=== AGENT MODE ===" not in system:
+            system += agent_instructions
 
     # 2. user-блок: кодеру и vision добавляем code_context/RAG/файлы
     code_trimmed = False

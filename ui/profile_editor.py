@@ -13,10 +13,10 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget,
     QLineEdit, QTextEdit, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
-    QLabel, QFileDialog, QFrame,
+    QLabel, QFileDialog, QFrame, QCheckBox,
 )
 
-from core.profiles import AIProfile, ProfileKind, ChatTemplate
+from core.profiles import AIProfile, ProfileKind, ChatTemplate, DEFAULT_AGENT_CODER_PROMPT
 from core.paths import list_available_models
 from core.token_budget import TokenBudget
 from .persona_editor import PersonaEditor
@@ -25,6 +25,7 @@ from .persona_editor import PersonaEditor
 # Готовые шаблоны системных промптов
 PROMPT_PRESETS_CODER = {
     "По умолчанию (Qwen Coder)": "default",
+    "Агент-кодер (tools)": DEFAULT_AGENT_CODER_PROMPT,
     "С RAG (учитывает релевантный код проекта)": """You are an expert software engineer.
 Use the provided code context and the relevant project snippets to write code that fits the codebase.
 Never invent APIs that aren't in the context.
@@ -83,6 +84,8 @@ class ProfileEditor(QWidget):
         p.n_gpu_layers = self.gpu_layers_spin.value()
 
         p.system_prompt = self.prompt_edit.toPlainText()
+        if p.kind == ProfileKind.CODER and hasattr(self, "agent_mode_check"):
+            p.agent_mode = self.agent_mode_check.isChecked()
 
         p.temperature = self.temp_spin.value()
         p.top_p = self.top_p_spin.value()
@@ -351,6 +354,13 @@ class ProfileEditor(QWidget):
 
         # подсказка
         if self._profile.kind == ProfileKind.CODER:
+            self.agent_mode_check = QCheckBox("Agent mode: читать/писать файлы и запускать tools")
+            self.agent_mode_check.setToolTip(
+                "Кодер сможет вызывать XML-инструменты read_file/list_files/search_files "
+                "и получать результаты обратно в контекст."
+            )
+            form.addRow("Агент:", self.agent_mode_check)
+
             hint_text = (
                 "Для кода: <b>temperature 0.1–0.3</b>, top_p 0.9. "
                 "Низкая температура = более точный детерминированный код."
@@ -396,6 +406,8 @@ class ProfileEditor(QWidget):
         self.rep_pen_spin.setValue(p.repeat_penalty)
         self.max_tokens_spin.setValue(p.max_tokens)
         self.stop_edit.setText(", ".join(p.stop_sequences))
+        if p.kind == ProfileKind.CODER and hasattr(self, "agent_mode_check"):
+            self.agent_mode_check.setChecked(getattr(p, "agent_mode", False))
 
         if self.persona_editor is not None:
             self.persona_editor.set_persona(p.persona)

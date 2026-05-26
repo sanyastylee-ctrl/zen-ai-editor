@@ -138,6 +138,25 @@ class SettingsDialog(QDialog):
         row.addStretch()
         layout.addLayout(row)
 
+        agent_row = QHBoxLayout()
+        agent_row.setSpacing(10)
+        agent_label = QLabel("Agent confirmation:")
+        agent_label.setStyleSheet("color:#B0B0B0; font-size:12px;")
+        agent_row.addWidget(agent_label)
+
+        self.agent_policy_combo = QComboBox()
+        self.agent_policy_combo.addItem("Confirm changes", "confirm_changes")
+        self.agent_policy_combo.addItem("Auto-confirm", "auto_confirm")
+        self.agent_policy_combo.addItem("Confirm all", "confirm_all")
+        self.agent_policy_combo.addItem("Read-only", "read_only")
+        current_policy = self.app_settings.get("agent_confirmation_policy", "confirm_changes")
+        idx = self.agent_policy_combo.findData(current_policy)
+        if idx >= 0:
+            self.agent_policy_combo.setCurrentIndex(idx)
+        agent_row.addWidget(self.agent_policy_combo)
+        agent_row.addStretch()
+        layout.addLayout(agent_row)
+
         return wrap
 
     # ---------- profiles ----------
@@ -302,6 +321,7 @@ class SettingsDialog(QDialog):
         # 2. сохранить общие настройки
         self.app_settings["use_rag"] = self.rag_check.isChecked()
         self.app_settings["diff_before_apply"] = self.diff_check.isChecked()
+        self.app_settings["agent_confirmation_policy"] = self.agent_policy_combo.currentData()
 
         self.accept()
 

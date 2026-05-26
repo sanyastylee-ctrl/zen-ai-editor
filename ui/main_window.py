@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import sys
+from datetime import datetime
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFileSystemModel, QFont, QKeySequence, QShortcut, QAction
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
@@ -32,7 +34,10 @@ from core.model_manager import ModelManager, LLAMA_AVAILABLE
 from core.paths import resolve_model_path
 from core.token_budget import TokenBudget
 from core.projects import ProjectManager
+from core.settings import PersistentSettings
+from ai.agent import AgentWorker
 from ai.worker import InferenceWorker
+from ui.chat import ChatView
 from ui.profile_switcher import ProfileSwitcher
 from ui.settings_dialog import SettingsDialog
 from rag.project_rag import ProjectRAG, RagIndexWorker, RAG_AVAILABLE
@@ -65,23 +70,39 @@ class ZenEditor(QMainWindow):
         self.app_settings = {
             "use_rag": False,
             "diff_before_apply": True,
+            "agent_confirmation_policy": "confirm_changes",
         }
+        saved_settings = PersistentSettings.load()
+        for key in self.app_settings:
+            if key in saved_settings:
+                self.app_settings[key] = saved_settings[key]
 
         self.current_file_path: str = ""
-        self.worker: InferenceWorker | None = None
+        self.worker: InferenceWorker | AgentWorker | None = None
 
         # стрим текущего ответа (для apply_code_from_chat)
         self._current_ai_response = ""
+        self._current_message_buffer = ""
+        self._current_response_profile_id: str = ""
+        self._current_assistant_record: dict | None = None
+        self._current_assistant_sender = "Ассистент"
+        self._current_assistant_kind = ""
+        self._agent_tool_records: dict[str, tuple[str, dict]] = {}
+        self._stream_update_timer = QTimer(self)
+        self._stream_update_timer.setSingleShot(True)
+        self._stream_update_timer.setInterval(50)
+        self._stream_update_timer.timeout.connect(self._flush_stream_update)
 
         # Раздельные истории для разных профилей.
         # Ключ — profile_id, значение — list[(user, assistant)].
         self._histories: dict[str, list[tuple[str, str]]] = {}
-        # Лог сырых сообщений для отображения чата (по профилю)
-        self._chat_html: dict[str, str] = {}
+        # Визуальные записи чата для ChatView (по профилю).
+        self._chat_records: dict[str, list[dict]] = {}
 
         self.rag = ProjectRAG()
         self._rag_worker: RagIndexWorker | None = None
         self._rag_chunks = 0
+        self._terminal_history: list[str] = []
 
         # ---------- ui ----------
         self.setStyleSheet(self._stylesheet())
@@ -259,10 +280,9 @@ class ZenEditor(QMainWindow):
         layout = QVBoxLayout(zone)
         layout.setContentsMargins(0, 0, 10, 0)
 
-        self.chat_history = QTextEdit()
-        self.chat_history.setReadOnly(True)
-        self.chat_history.setPlaceholderText("Здесь будет диалог с ИИ...")
-        layout.addWidget(self.chat_history, 1)
+        self.chat_view = ChatView()
+        self.chat_view.insert_requested.connect(self._insert_code_from_chat)
+        layout.addWidget(self.chat_view, 1)
 
         # ввод
         input_row = QHBoxLayout()
@@ -288,15 +308,6 @@ class ZenEditor(QMainWindow):
         self.stop_btn.setToolTip("Остановить генерацию")
         self.stop_btn.clicked.connect(self.stop_generation)
         input_row.addWidget(self.stop_btn)
-
-        self.apply_btn = QPushButton("↙ В редактор")
-        self.apply_btn.setObjectName("secondary")
-        self.apply_btn.setToolTip(
-            "Вставить код из последнего ответа.\n"
-            "Если в редакторе есть выделение — заменит его, иначе — весь файл."
-        )
-        self.apply_btn.clicked.connect(self.apply_code_from_chat)
-        input_row.addWidget(self.apply_btn)
 
         layout.addLayout(input_row)
 
@@ -410,19 +421,25 @@ class ZenEditor(QMainWindow):
         return tree_str + tree if tree else ""
 
     def _refresh_chat_view(self, profile_id: str) -> None:
-        self.chat_history.setHtml(self._chat_html.get(profile_id, ""))
-        # прокрутка в конец
-        sb = self.chat_history.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self.chat_view.set_records(self._chat_records.setdefault(profile_id, []))
 
     def _append_chat(self, profile_id: str, html: str) -> None:
-        prev = self._chat_html.get(profile_id, "")
-        self._chat_html[profile_id] = prev + html
+        self._add_chat_record(profile_id, {
+            "role": "system",
+            "sender": "System",
+            "text": self._plain_from_html(html),
+        })
+
+    def _add_chat_record(self, profile_id: str, record: dict) -> None:
+        record.setdefault("time", datetime.now().isoformat(timespec="minutes"))
+        records = self._chat_records.setdefault(profile_id, [])
+        records.append(record)
         if self.profile_switcher.active_id() == profile_id:
-            self.chat_history.moveCursor(self.chat_history.textCursor().MoveOperation.End)
-            self.chat_history.insertHtml(html)
-            sb = self.chat_history.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            self.chat_view.add_record(record)
+
+    def _update_chat_record(self, profile_id: str, record: dict) -> None:
+        if self.profile_switcher.active_id() == profile_id:
+            self.chat_view.update_record(record)
 
     def send_message(self) -> None:
         text = self.chat_input.text().strip()
@@ -486,19 +503,21 @@ class ZenEditor(QMainWindow):
         if attachment_text and profile.kind == ProfileKind.COMPANION:
             full_text = f"Вложенные файлы:\n{attachment_text}\n\n{text}".strip()
 
-        # Рендерим юзер-сообщение (с жесткими переносами <br>)
-        safe_text = self._escape(text)
+        # Рендерим сообщение пользователя.
         if attached_paths:
             file_names = ", ".join(os.path.basename(p) for p in attached_paths)
-            if safe_text:
-                display_html = f"{safe_text}<br><i style='color:#888; font-size:12px;'>📎 Прикреплено: {file_names}</i>"
+            if text:
+                display_text = f"{text}\n\nПрикреплено: {file_names}"
             else:
-                display_html = f"<i style='color:#888; font-size:12px;'>📎 Отправлен файл: {file_names}</i>"
+                display_text = f"Прикреплен файл: {file_names}"
         else:
-            display_html = safe_text
+            display_text = text
 
-        user_html = f"<span style='color:#9CDCFE;'><b>Ты:</b></span><br><span style='color:#D4D4D4;'>{display_html}</span><br><br>"
-        self._append_chat_active(user_html)
+        self._add_chat_record(profile.id, {
+            "role": "user",
+            "sender": "Ты",
+            "text": display_text,
+        })
 
         # --- ПОДГОТОВКА СВЕРХКОМПЛЕКСНОГО КОНТЕКСТА ---
         code_context = ""
@@ -523,22 +542,41 @@ class ZenEditor(QMainWindow):
             if self.app_settings.get("use_rag") and self._rag_chunks > 0:
                 rag_snippets = self.rag.search(full_text, top_k=5)
 
-        # Вступление для ответа (с жестким переносом <br>)
         speaker = profile.name if profile.kind == ProfileKind.COMPANION else "Ассистент"
-        self._append_chat_active(f"<span style='color:#CE9178;'><b>{speaker}:</b></span><br>")
         self._current_ai_response = ""
+        self._current_message_buffer = ""
+        self._current_response_profile_id = profile.id
+        self._current_assistant_sender = speaker
+        self._current_assistant_kind = profile.kind.value
+        self._current_assistant_record = None
 
         history = self._histories.get(profile.id, [])
 
-        self.worker = InferenceWorker(
-            profile=profile,
-            user_message=full_text,
-            code_context=code_context,
-            rag_snippets=rag_snippets,
-            history=history,
-            user_name=profile.persona.get("user_name", "") if profile.kind == ProfileKind.COMPANION else "",
-            attached_files=attached_paths,
-        )
+        if profile.kind == ProfileKind.CODER and getattr(profile, "agent_mode", False):
+            self.worker = AgentWorker(
+                profile=profile,
+                user_message=full_text,
+                code_context=code_context,
+                history=history,
+                project_root=self.projects.current,
+                terminal_history=self._terminal_history,
+                confirmation_policy=self.app_settings.get(
+                    "agent_confirmation_policy", "confirm_changes"
+                ),
+            )
+            self.worker.tool_started.connect(self._on_agent_tool_started)
+            self.worker.tool_finished.connect(self._on_agent_tool_finished)
+            self.worker.confirmation_requested.connect(self._on_agent_confirmation_requested)
+        else:
+            self.worker = InferenceWorker(
+                profile=profile,
+                user_message=full_text,
+                code_context=code_context,
+                rag_snippets=rag_snippets,
+                history=history,
+                user_name=profile.persona.get("user_name", "") if profile.kind == ProfileKind.COMPANION else "",
+                attached_files=attached_paths,
+            )
         self.worker.chunk_received.connect(self._on_chunk)
         self.worker.finished_signal.connect(lambda: self._on_generation_done(profile.id, full_text))
         self.worker.model_loading.connect(lambda p: self.model_status.setText(f"Загружаю {os.path.basename(p)}..."))
@@ -553,22 +591,144 @@ class ZenEditor(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.worker.start()
 
+    def _on_agent_tool_started(self, payload: dict) -> None:
+        if self._current_assistant_record is not None:
+            self._current_assistant_record["streaming"] = False
+            self._update_chat_record(
+                self._current_response_profile_id,
+                self._current_assistant_record,
+            )
+            self._current_assistant_record = None
+            self._current_message_buffer = ""
+
+        name = payload.get("name", "")
+        args = payload.get("args", {})
+        call_id = payload.get("id", "")
+        detail = ""
+        if isinstance(args, dict):
+            if args.get("path"):
+                detail = f"Path: {args.get('path', '')}"
+            elif args.get("query"):
+                detail = f"Query: {args.get('query', '')}"
+            elif args.get("command"):
+                detail = f"$ {args.get('command', '')}"
+        pid = self._current_response_profile_id or self.profile_switcher.active_id()
+        if not pid:
+            return
+        record = {
+            "role": "tool",
+            "sender": "Tool",
+            "tool_name": name,
+            "detail": detail,
+            "output": "running...",
+            "ok": None,
+        }
+        self._agent_tool_records[str(call_id)] = (pid, record)
+        self._add_chat_record(pid, record)
+
+    def _on_agent_tool_finished(self, payload: dict) -> None:
+        name = payload.get("name", "")
+        call_id = str(payload.get("id", ""))
+        output = str(payload.get("output", ""))
+        ok = bool(payload.get("ok", False))
+        meta = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
+        title = payload.get("title") or f"Tool: {name}"
+        short = output
+        if len(short) > 4000:
+            short = short[:4000] + "\n[output truncated in chat]"
+        if name == "run_terminal":
+            self._terminal_history.append(short)
+            self._terminal_history = self._terminal_history[-5:]
+        extra = ""
+        if meta.get("lines"):
+            extra = f" ({meta.get('lines')} строк)"
+        elif meta.get("count") is not None:
+            extra = f" ({meta.get('count')} совпадений)"
+        stored = self._agent_tool_records.get(call_id)
+        if stored:
+            pid, record = stored
+            record.update({
+                "tool_name": str(title) + extra,
+                "output": short,
+                "ok": ok,
+            })
+            self._update_chat_record(pid, record)
+        else:
+            pid = self._current_response_profile_id or self.profile_switcher.active_id()
+            if pid:
+                self._add_chat_record(pid, {
+                    "role": "tool",
+                    "sender": "Tool",
+                    "tool_name": str(title) + extra,
+                    "detail": "",
+                    "output": short,
+                    "ok": ok,
+                })
+
+    def _on_agent_confirmation_requested(self, payload: dict) -> None:
+        name = payload.get("name", "")
+        args = payload.get("args", {}) if isinstance(payload.get("args"), dict) else {}
+        call_id = payload.get("id", "")
+        preview = str(payload.get("preview", ""))
+
+        subject = args.get("path") or args.get("command") or args.get("query") or ""
+        msg = f"Разрешить tool «{name}»?"
+        if subject:
+            msg += f"\n\n{subject}"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Agent confirmation")
+        box.setText(msg)
+        if preview:
+            box.setDetailedText(preview[:20000])
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        accepted = box.exec() == QMessageBox.StandardButton.Yes
+
+        if self.worker and hasattr(self.worker, "resolve_confirmation"):
+            self.worker.resolve_confirmation(call_id, accepted)
+
     def _on_chunk(self, chunk: str) -> None:
         self._current_ai_response += chunk
-        self.chat_history.moveCursor(self.chat_history.textCursor().MoveOperation.End)
-        self.chat_history.insertPlainText(chunk)
-        sb = self.chat_history.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._current_message_buffer += chunk
+        if self._current_assistant_record is None and self._current_response_profile_id:
+            self._current_assistant_record = {
+                "role": "assistant",
+                "sender": self._current_assistant_sender,
+                "text": "",
+                "profile_kind": self._current_assistant_kind,
+                "streaming": True,
+            }
+            self._add_chat_record(
+                self._current_response_profile_id,
+                self._current_assistant_record,
+            )
+        if self._current_assistant_record is not None:
+            self._current_assistant_record["text"] = self._current_message_buffer
+            self._current_assistant_record["streaming"] = True
+            if not self._stream_update_timer.isActive():
+                self._stream_update_timer.start()
+
+    def _flush_stream_update(self) -> None:
+        if self._current_assistant_record is None:
+            return
+        if not self._current_response_profile_id:
+            return
+        self._current_assistant_record["text"] = self._current_message_buffer
+        self._current_assistant_record["streaming"] = True
+        self._update_chat_record(
+            self._current_response_profile_id,
+            self._current_assistant_record,
+        )
 
     def _on_generation_done(self, profile_id: str, user_msg: str) -> None:
-        esc_resp = self._escape(self._current_ai_response).replace("\n", "<br>")
-        # Добавляем жесткие отступы через <br><br> и закрываем тег
-        end_html = f"<span style='color:#D4D4D4;'>{esc_resp}</span><br><br>"
-        self._chat_html[profile_id] = self._chat_html.get(profile_id, "") + end_html
-        
-        if self.profile_switcher.active_id() == profile_id:
-            self.chat_history.moveCursor(self.chat_history.textCursor().MoveOperation.End)
-            self.chat_history.insertHtml("<br><br>")
+        if self._stream_update_timer.isActive():
+            self._stream_update_timer.stop()
+        if self._current_assistant_record is not None:
+            self._current_assistant_record["text"] = self._current_message_buffer
+            self._current_assistant_record["streaming"] = False
+            self._update_chat_record(profile_id, self._current_assistant_record)
 
         hist = self._histories.setdefault(profile_id, [])
         hist.append((user_msg, self._current_ai_response))
@@ -577,6 +737,11 @@ class ZenEditor(QMainWindow):
             del hist[: len(hist) - 50]
 
         self._current_ai_response = ""
+        self._current_message_buffer = ""
+        self._current_response_profile_id = ""
+        self._current_assistant_record = None
+        self._current_assistant_sender = "Ассистент"
+        self._current_assistant_kind = ""
         self.stop_btn.setEnabled(False)
         self.worker = None
 
@@ -625,6 +790,9 @@ class ZenEditor(QMainWindow):
         else:
             new_code = last_response.strip()
 
+        self._insert_code_from_chat(new_code)
+
+    def _insert_code_from_chat(self, new_code: str) -> None:
         old_code = self._get_editor_text()
         has_selection = self._editor_has_selection()
 
@@ -966,6 +1134,9 @@ class ZenEditor(QMainWindow):
         dlg = SettingsDialog(self.pm, self.app_settings, parent=self)
         if dlg.exec() == dlg.DialogCode.Accepted:
             self.app_settings.update(dlg.get_app_settings())
+            saved = PersistentSettings.load()
+            saved.update(self.app_settings)
+            PersistentSettings.save(saved)
             current = self.profile_switcher.active_id()
             profiles = self.pm.all()
             if current and current not in {p.id for p in profiles}:
@@ -1017,68 +1188,74 @@ class ZenEditor(QMainWindow):
                     .replace("<", "&lt;").replace(">", "&gt;"))
 
     @staticmethod
+    def _plain_from_html(text: str) -> str:
+        text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        text = re.sub(r"<[^>]+>", "", text)
+        return html.unescape(text).strip()
+
+    @staticmethod
     def _stylesheet() -> str:
         return """
-            QMainWindow { background-color: #1E1E1E; }
-            QFrame { background-color: #252526; border: none; }
+            QMainWindow { background-color: #1A1A1F; }
+            QFrame { background-color: #22232A; border: none; }
             QTextEdit {
-                background-color: #1E1E1E; color: #D4D4D4;
+                background-color: #1A1A1F; color: #E7E8EE;
                 border: none; padding: 10px; font-size: 14px;
             }
             QLineEdit {
-                background-color: #3C3C3C; color: #FFFFFF;
-                border: 1px solid #555; border-radius: 6px;
+                background-color: #2A2D38; color: #FFFFFF;
+                border: 1px solid #3B3D48; border-radius: 10px;
                 padding: 8px 10px; font-size: 13px;
             }
             QPushButton {
-                background-color: #0E639C; color: white;
-                border-radius: 6px; padding: 7px 14px;
+                background-color: #A78BFA; color: #17171C;
+                border-radius: 10px; padding: 7px 14px;
                 font-weight: 500; font-size: 12px; border: none;
             }
-            QPushButton:hover { background-color: #1177BB; }
-            QPushButton:disabled { background-color: #3A3A3A; color: #666; }
+            QPushButton:hover { background-color: #B8A3FF; }
+            QPushButton:disabled { background-color: #3B3D48; color: #777A88; }
             QPushButton#secondary {
-                background-color: #3A3A3A; color: #D4D4D4;
-                border: 1px solid #4A4A4A;
+                background-color: #3B3D48; color: #E7E8EE;
+                border: 1px solid #4A4D5C;
             }
-            QPushButton#secondary:hover { background-color: #4A4A4A; }
+            QPushButton#secondary:hover { background-color: #4A4D5C; }
             QPushButton#stop_btn:enabled { background-color: #8B2020; color: white; }
             QPushButton#stop_btn:enabled:hover { background-color: #A52828; }
-            QPushButton#stop_btn:disabled { background-color: #3A3A3A; color: #666; }
+            QPushButton#stop_btn:disabled { background-color: #3B3D48; color: #777A88; }
             QPushButton#green_btn {
-                background-color: #1B4F1B; color: #4EC9B0;
-                border: 1px solid #2A7A2A;
+                background-color: #24443B; color: #6EE7B7;
+                border: 1px solid #2F6B58;
             }
-            QPushButton#green_btn:hover { background-color: #236B23; }
-            QSplitter::handle { background-color: #333; width: 2px; }
+            QPushButton#green_btn:hover { background-color: #2F5F50; }
+            QSplitter::handle { background-color: #30313A; width: 2px; }
             QTreeView {
-                background-color: #252526; color: #CCC;
+                background-color: #22232A; color: #E7E8EE;
                 border: none; font-size: 13px;
             }
             QTreeView::item:hover { background-color: #2A2D2E; }
             QTreeView::item:selected { background-color: #37373D; }
             QMenu {
-                background-color: #252526; color: #D4D4D4;
-                border: 1px solid #333;
+                background-color: #22232A; color: #E7E8EE;
+                border: 1px solid #343642;
             }
             QMenu::item:selected {
-                background-color: #0E639C;
+                background-color: #4A3D73;
             }
-            QTabWidget::pane { border: none; background: #1E1E1E; }
+            QTabWidget::pane { border: none; background: #1A1A1F; }
             QTabBar::tab {
-                background: #2D2D2D; color: #888;
+                background: #2A2D38; color: #A4A7B5;
                 padding: 6px 16px; border: none;
             }
             QTabBar::tab:selected {
-                background: #1E1E1E; color: #D4D4D4;
-                border-bottom: 2px solid #0E639C;
+                background: #1A1A1F; color: #E7E8EE;
+                border-bottom: 2px solid #A78BFA;
             }
-            QTabBar::tab:hover { background: #3C3C3C; color: #D4D4D4; }
+            QTabBar::tab:hover { background: #3B3D48; color: #E7E8EE; }
             QProgressBar {
-                background: #3C3C3C; border-radius: 3px;
+                background: #3B3D48; border-radius: 4px;
                 height: 6px; text-align: right;
-                font-size: 10px; color: #888;
+                font-size: 10px; color: #A4A7B5;
             }
-            QProgressBar::chunk { background: #0E639C; border-radius: 3px; }
-            QLabel#token_label { color: #888; font-size: 11px; }
+            QProgressBar::chunk { background: #A78BFA; border-radius: 4px; }
+            QLabel#token_label { color: #A4A7B5; font-size: 11px; }
         """
