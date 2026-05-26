@@ -1,0 +1,38 @@
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Тяжелые модели и веса (ОБЯЗАТЕЛЬНО ИГНОРИРОВАТЬ)
+models/
+*.gguf
+*.bin
+*.pt
+*.safetensors
+
+# Локальные данные и бэкапы твоего редактора
+.zen_ai/
+
+# Временные файлы изображений ComfyUI (если тестировал)
+zen_comfyui_*.png
+
+# Логи и кэш сторонних утилит (Aider и т.д.)
+.aider*
+.aider.tags.cache.v4
+.aider.chat.history.md
+.aider.input.history
+
+# Настройки IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Системные файлы
+.DS_Store
+Thumbs.db
