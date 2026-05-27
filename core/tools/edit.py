@@ -12,6 +12,8 @@ class EditFileTool(Tool):
 
     def execute(self, call: ToolCall) -> ToolResult:
         try:
+            if "new_str" not in call.args:
+                return ToolResult.error("missing new_str", critical=True)
             path = self.safe_path(call.args.get("path", ""))
             old_str = call.args.get("old_str", "")
             new_str = call.args.get("new_str", "")

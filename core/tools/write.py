@@ -13,6 +13,8 @@ class WriteFileTool(Tool):
 
     def execute(self, call: ToolCall) -> ToolResult:
         try:
+            if "content" not in call.args:
+                return ToolResult.error("missing content; write_file requires full file content")
             path = self.safe_path(call.args.get("path", ""), allow_missing=True)
             content = call.args.get("content", "")
             os.makedirs(os.path.dirname(path), exist_ok=True)

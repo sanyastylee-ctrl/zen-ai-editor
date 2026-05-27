@@ -9,7 +9,7 @@ AI Profile system.
 - шаблон чата (chatml / llama3 / mistral / gemma / deepseek / auto)
 - персональные данные (только для companion-профиля)
 
-Профили хранятся в ~/.zen_ai/profiles.json, никакого хардкода в коде.
+Профили хранятся в AppData/ZenAI/settings/profiles.json.
 """
 
 from __future__ import annotations
@@ -22,13 +22,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .app_data import SETTINGS_DIR, migrate_legacy_file
+
 
 # ============================================================
 # КОНСТАНТЫ
 # ============================================================
 
-CONFIG_DIR = Path.home() / ".zen_ai"
+CONFIG_DIR = SETTINGS_DIR
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
+LEGACY_PROFILES_FILE = Path.home() / ".zen_ai" / "profiles.json"
 
 
 class ProfileKind(str, Enum):
@@ -135,12 +138,16 @@ class ProfileManager:
             ProfileKind.VISION: None,
         }
         self._ensure_config_dir()
+        migrate_legacy_file(LEGACY_PROFILES_FILE, PROFILES_FILE)
 
     # ---------- io ----------
 
     @staticmethod
     def _ensure_config_dir() -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
     def load(self) -> None:
         if not PROFILES_FILE.exists():
@@ -176,17 +183,21 @@ class ProfileManager:
             self.save()
 
     def save(self) -> None:
-        self._ensure_config_dir()
-        data = {
-            "version": 1,
-            "profiles": [p.to_dict() for p in self.profiles.values()],
-            "active": {k.value: v for k, v in self.active.items()},
-        }
-        # атомарная запись — пишем во временный, потом переименовываем
-        tmp = PROFILES_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(PROFILES_FILE)
+        try:
+            self._ensure_config_dir()
+            data = {
+                "version": 1,
+                "profiles": [p.to_dict() for p in self.profiles.values()],
+                "active": {k.value: v for k, v in self.active.items()},
+            }
+            # атомарная запись — пишем во временный, потом переименовываем
+            tmp = PROFILES_FILE.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            tmp.replace(PROFILES_FILE)
+        except OSError:
+            # Read-only AppData should not make profiles unusable in memory.
+            pass
 
     # ---------- profiles api ----------
 
@@ -326,17 +337,12 @@ If a request is ambiguous, make the most reasonable assumption and state it in o
 DEFAULT_AGENT_CODER_PROMPT = DEFAULT_CODER_PROMPT + """
 
 Agent mode:
-- You have the ability to create and edit files directly on the user's disk.
-- To create or modify a file, you MUST use the following exact syntax:
-
-[CREATE_FILE: relative/path/to/file.py]
-<file content here>
-[/CREATE_FILE]
-
-- You can output multiple files. 
-- Always use relative paths from the project root. 
-- Do not use markdown code blocks (```) for files you want to save, use ONLY the [CREATE_FILE: path] tags. 
-- Explain your plan briefly, then output the file blocks."""
+- You can inspect and change the current project through XML tool calls supplied below.
+- To create or overwrite a file, always call write_file with both <path> and complete <content>.
+- To modify an existing file, read it first and then call edit_file or apply_patch.
+- To verify work, call run_terminal with a safe command.
+- Never use legacy [CREATE_FILE:] or [RUN:] blocks; use only <tool name="..."> XML calls.
+- Always use project-relative paths."""
 
 
 DEFAULT_COMPANION_PROMPT = """You are {character_name}, a {age}-year-old woman. You are NOT an AI, NOT an assistant, NOT a chatbot. You are a real person having a real conversation with {user_name}.

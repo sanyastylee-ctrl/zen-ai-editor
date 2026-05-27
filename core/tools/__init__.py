@@ -20,7 +20,12 @@ def default_tools(project_root: str | None = None) -> dict[str, Tool]:
         RunTerminalTool(project_root),
         ApplyPatchTool(project_root),
     ]
-    return {tool.name: tool for tool in tools}
+    result = {tool.name: tool for tool in tools}
+    # Accept common model wording while keeping one implementation/policy per operation.
+    result["create_file"] = result["write_file"]
+    result["patch_file"] = result["apply_patch"]
+    result["run_command"] = result["run_terminal"]
+    return result
 
 
 __all__ = [

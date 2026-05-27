@@ -11,10 +11,12 @@ import html
 import os
 import re
 import threading
+import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.chat_templates import detect_template, format_prompt
+from core.diagnostics import acceleration_warning, write_log
 from core.model_manager import LLAMA_AVAILABLE, ModelManager
 from core.paths import resolve_model_path
 from core.profiles import AIProfile, ChatTemplate
@@ -22,7 +24,10 @@ from core.token_budget import TokenBudget
 from core.tools import ToolCall, ToolResult, default_tools
 
 
-MAX_ITERATIONS = 15
+MAX_AGENT_STEPS = 5
+MAX_TOOL_CALLS = 10
+MAX_GENERATION_SECONDS = 180
+MAX_CONTEXT_CHARS = 240_000
 MAX_CRITICAL_ERRORS = 3
 
 TOOL_BLOCK_RE = re.compile(
@@ -33,10 +38,39 @@ ARG_RE = re.compile(
     r"<(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)>(?P<value>.*?)</(?P=key)>",
     re.IGNORECASE | re.DOTALL,
 )
+LEGACY_FILE_RE = re.compile(
+    r"\[(?:CREATE_FILE|FILE):\s*(?P<path>[^\]\n]+?)\s*\]\s*"
+    r"(?P<content>.*?)\[/(?:CREATE_FILE|FILE)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+LEGACY_RUN_RE = re.compile(r"\[RUN:\s*(?P<command>[^\]\n]+?)\s*\]", re.IGNORECASE)
+LEGACY_START_RE = re.compile(r"\[(?:CREATE_FILE|FILE|RUN):", re.IGNORECASE)
+TOOL_START_RE = re.compile(r"<tool\b", re.IGNORECASE)
+FENCED_CONTENT_RE = re.compile(
+    r"^\s*```[a-zA-Z0-9_+\-]*\s*\n(?P<content>.*?)\n```\s*$",
+    re.DOTALL,
+)
+INLINE_CODE_RE = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
+
+REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
+    "write_file": ("path", "content"),
+    "create_file": ("path", "content"),
+    "edit_file": ("path", "old_str", "new_str"),
+    "apply_patch": ("patch",),
+    "patch_file": ("patch",),
+    "run_terminal": ("command",),
+    "run_command": ("command",),
+    "read_file": ("path",),
+    "search_files": ("query",),
+}
 
 
 AGENT_TOOL_INSTRUCTIONS = """
 You can operate on the current project by emitting XML tool calls.
+
+Use only the XML tool protocol below. This overrides any earlier [CREATE_FILE]
+or [RUN:] instructions saved in an older profile. Do not wrap tool calls in
+markdown fences.
 
 Available tools:
 
@@ -57,60 +91,151 @@ Available tools:
 <tool name="write_file">
 <path>core/new_module.py</path>
 <content>
-...complete file content...
+def hello():
+    return "hello"
+</content>
+</tool>
+
+To create a file and write it in one operation:
+
+<tool name="write_file">
+<path>hello.py</path>
+<content>print("hi")
 </content>
 </tool>
 
 <tool name="edit_file">
-<path>core/profiles.py</path>
-<old_str>exact text to replace</old_str>
-<new_str>replacement text</new_str>
+<path>hello.py</path>
+<old_str>print("hi")</old_str>
+<new_str>print("hello world")</new_str>
 </tool>
 
 <tool name="run_terminal">
-<command>pytest tests/ -v</command>
+<command>python hello.py</command>
 </tool>
 
 <tool name="apply_patch">
 <patch>
---- a/file.py
-+++ b/file.py
+--- a/hello.py
++++ b/hello.py
 @@
--old
-+new
+-print("hi")
++print("hello world")
 </patch>
 </tool>
 
 Rules:
 1. First inspect files before changing behavior.
-2. Use tools only when you need project facts or verification.
-3. After a tool result, continue from the new evidence.
-4. When you are done, answer normally without any <tool> block.
-5. Tool paths must be project-relative.
+2. To create or replace a file, call write_file with BOTH path and complete content.
+3. To change an existing file, read it first, then use edit_file or apply_patch.
+4. To run a safe verification command, use run_terminal.
+5. Use tools only when you need project facts or verification.
+6. After a tool result, continue from the new evidence.
+7. When you are done, answer normally without any <tool> block.
+8. Tool paths must be project-relative.
 """
 
 
-def parse_tools(text: str) -> list[ToolCall]:
+def _content_value(value: str) -> str:
+    if value.startswith("\n"):
+        value = value[1:]
+    fenced = FENCED_CONTENT_RE.match(value)
+    return fenced.group("content") if fenced else value
+
+
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    return [match.span() for match in INLINE_CODE_RE.finditer(text)]
+
+
+def _inside_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _find_dangling_tool_start(text: str, patterns=None):
+    spans = _inline_code_spans(text)
+    patterns = patterns or (TOOL_START_RE, LEGACY_START_RE)
+    matches = []
+    for pattern in patterns:
+        matches.extend(pattern.finditer(text))
+    matches.sort(key=lambda match: match.start())
+    for match in matches:
+        if not _inside_spans(match.start(), spans):
+            return match
+    return None
+
+
+def parse_tool_response(text: str) -> tuple[list[ToolCall], list[str]]:
     calls: list[ToolCall] = []
+    errors: list[str] = []
+    matched_spans: list[tuple[int, int]] = []
     for match in TOOL_BLOCK_RE.finditer(text):
+        matched_spans.append(match.span())
         body = match.group("body")
         args: dict[str, str] = {}
         for arg_match in ARG_RE.finditer(body):
             key = arg_match.group("key").strip().lower()
-            value = html.unescape(arg_match.group("value").strip())
+            raw_value = arg_match.group("value")
+            value = _content_value(raw_value) if key in {"content", "old_str", "new_str", "patch"} else html.unescape(raw_value.strip())
             args[key] = value
+        call = ToolCall(
+            name=match.group("name").strip().lower(),
+            args=args,
+            raw=match.group(0),
+        )
+        missing = [key for key in REQUIRED_ARGS.get(call.name, ()) if key not in args]
+        if missing:
+            errors.append(f"{call.name}: missing <{'>, <'.join(missing)}>")
+        else:
+            calls.append(call)
+
+    residual = text
+    for start, end in reversed(matched_spans):
+        residual = residual[:start] + residual[end:]
+    if _find_dangling_tool_start(residual, (TOOL_START_RE,)):
+        errors.append("truncated or malformed XML <tool> block")
+
+    # Backward compatibility for saved Agent-Coder prompts from before XML tools.
+    for match in LEGACY_FILE_RE.finditer(residual):
         calls.append(
             ToolCall(
-                name=match.group("name").strip().lower(),
-                args=args,
+                name="write_file",
+                args={
+                    "path": match.group("path").strip(),
+                    "content": _content_value(match.group("content")),
+                },
                 raw=match.group(0),
             )
         )
+    legacy_without_files = LEGACY_FILE_RE.sub("", residual)
+    for match in LEGACY_RUN_RE.finditer(legacy_without_files):
+        calls.append(
+            ToolCall(
+                name="run_terminal",
+                args={"command": html.unescape(match.group("command").strip())},
+                raw=match.group(0),
+            )
+        )
+    legacy_remainder = LEGACY_RUN_RE.sub("", legacy_without_files)
+    if _find_dangling_tool_start(legacy_remainder, (LEGACY_START_RE,)):
+        errors.append("truncated or malformed legacy agent action")
+    return calls, errors
+
+
+def parse_tools(text: str) -> list[ToolCall]:
+    calls, _ = parse_tool_response(text)
     return calls
 
 
 def strip_tool_blocks(text: str) -> str:
-    return TOOL_BLOCK_RE.sub("", text).strip()
+    visible = TOOL_BLOCK_RE.sub("", text)
+    visible = LEGACY_FILE_RE.sub("", visible)
+    visible = LEGACY_RUN_RE.sub("", visible)
+    dangling = _find_dangling_tool_start(visible)
+    if dangling:
+        visible = visible[:dangling.start()]
+    if re.fullmatch(r"\s*```(?:xml|tool)?\s*```\s*", visible, re.IGNORECASE):
+        return ""
+    return visible.strip()
 
 
 class AgentWorker(QThread):
@@ -133,6 +258,10 @@ class AgentWorker(QThread):
         terminal_history: list[str] | None = None,
         session_summary: str = "",
         confirmation_policy: str = "confirm_changes",
+        max_agent_steps: int = MAX_AGENT_STEPS,
+        max_tool_calls: int = MAX_TOOL_CALLS,
+        max_generation_seconds: int = MAX_GENERATION_SECONDS,
+        max_context_chars: int = MAX_CONTEXT_CHARS,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -144,7 +273,13 @@ class AgentWorker(QThread):
         self.terminal_history = terminal_history or []
         self.session_summary = session_summary
         self.confirmation_policy = confirmation_policy
+        self.max_agent_steps = max(1, int(max_agent_steps or MAX_AGENT_STEPS))
+        self.max_tool_calls = max(1, int(max_tool_calls or MAX_TOOL_CALLS))
+        self.max_generation_seconds = max(1, int(max_generation_seconds or MAX_GENERATION_SECONDS))
+        self.max_context_chars = max(1000, int(max_context_chars or MAX_CONTEXT_CHARS))
         self._stop = False
+        self._tool_calls_used = 0
+        self._generation_interrupted_reason = ""
 
         self._tools = default_tools(self.project_root)
         self._cb_start = None
@@ -190,6 +325,11 @@ class AgentWorker(QThread):
         mm.on_load_finish(_on_finish)
 
         try:
+            warning = acceleration_warning(self.profile, model_path)
+            if warning:
+                self.status.emit("⚠ CPU backend")
+                self.chunk_received.emit(f"\n[Предупреждение: {warning}]\n")
+
             model = mm.get_model(
                 path=model_path,
                 n_ctx=self.profile.n_ctx,
@@ -198,30 +338,49 @@ class AgentWorker(QThread):
             transcript = self._initial_transcript()
             critical_errors = 0
 
-            for iteration in range(1, MAX_ITERATIONS + 1):
+            for iteration in range(1, self.max_agent_steps + 1):
                 if self._stop:
                     self.chunk_received.emit("\n[остановлено]")
                     break
-                if self._over_token_budget(transcript):
+                if self._over_context_budget(transcript):
                     self.chunk_received.emit("\n[Агент остановлен: превышен бюджет контекста]\n")
                     break
 
-                self.status.emit(f"Агент: итерация {iteration}/{MAX_ITERATIONS}")
+                self.status.emit(f"Агент: итерация {iteration}/{self.max_agent_steps}")
                 response = self._complete(model, transcript)
-                if self._stop:
-                    break
 
                 visible = strip_tool_blocks(response)
                 if visible:
                     self.chunk_received.emit(visible + "\n")
 
-                calls = parse_tools(response)
+                calls, parser_errors = parse_tool_response(response)
+                for error in parser_errors:
+                    self._report_parser_error(error)
+                    transcript.append(f"Tool parser error:\n[error: {error}]")
+
+                if self._generation_interrupted_reason:
+                    write_log(f"[agent_generation_stopped] {self._generation_interrupted_reason}")
+                    if calls:
+                        self.chunk_received.emit(
+                            "\n[Действия tool не выполнены: ответ модели был прерван]\n"
+                        )
+                    self.chunk_received.emit(
+                        f"\n[Агент остановлен: {self._generation_interrupted_reason}; частичный ответ сохранён]\n"
+                    )
+                    break
+
                 if not calls:
+                    if parser_errors:
+                        continue
                     break
 
                 transcript.append(f"Assistant tool request:\n{response}")
                 for call in calls:
+                    if self._tool_calls_used >= self.max_tool_calls:
+                        self.chunk_received.emit("\n[Агент остановлен: достигнут лимит tool calls]\n")
+                        return
                     result = self._execute_tool(call)
+                    self._tool_calls_used += 1
                     transcript.append(
                         f"Tool result for {call.name}:\n{result.output}"
                     )
@@ -263,6 +422,7 @@ class AgentWorker(QThread):
         return items
 
     def _complete(self, model, transcript: list[str]) -> str:
+        self._generation_interrupted_reason = ""
         system = self._agent_system_prompt()
         user = "\n\n---\n\n".join(transcript)
 
@@ -283,17 +443,25 @@ class AgentWorker(QThread):
         )
 
         chunks: list[str] = []
+        started = time.monotonic()
         for chunk in stream:
             if self._stop:
+                self._generation_interrupted_reason = "остановлено пользователем"
+                break
+            if time.monotonic() - started > self.max_generation_seconds:
+                self._stop = True
+                self._generation_interrupted_reason = "превышен лимит времени генерации"
                 break
             text = chunk["choices"][0]["text"]
             if text:
                 chunks.append(text)
         return "".join(chunks)
 
-    def _over_token_budget(self, transcript: list[str]) -> bool:
+    def _over_context_budget(self, transcript: list[str]) -> bool:
         system = self._agent_system_prompt()
         text = system + "\n\n" + "\n\n".join(transcript)
+        if len(text) > self.max_context_chars:
+            return True
         return TokenBudget.estimate(text) > (self.profile.n_ctx - self.profile.max_tokens)
 
     def _agent_system_prompt(self) -> str:
@@ -330,12 +498,14 @@ class AgentWorker(QThread):
         if tool is None:
             result = ToolResult.error(f"unknown tool: {call.name}", critical=True)
             self.tool_finished.emit({**payload, "ok": False, "output": result.output})
+            write_log(f"[agent_tool_error] {call.name}: {result.output}")
             return result
 
         self.tool_started.emit(payload)
         if self.confirmation_policy == "read_only" and (tool.mutates_project or tool.runs_command):
             result = ToolResult.error("tool blocked by read-only confirmation policy")
             self.tool_finished.emit({**payload, "ok": False, "output": result.output})
+            write_log(f"[agent_tool_error] {call.name}: {result.output}")
             return result
 
         if self._needs_confirmation(tool):
@@ -349,10 +519,12 @@ class AgentWorker(QThread):
             if self._stop:
                 result = ToolResult.error("stopped")
                 self.tool_finished.emit({**payload, "ok": False, "output": result.output})
+                write_log(f"[agent_tool_error] {call.name}: {result.output}")
                 return result
             if not accepted:
                 result = ToolResult(ok=False, output="[user rejected]")
                 self.tool_finished.emit({**payload, "ok": False, "output": result.output})
+                write_log(f"[agent_tool_rejected] {call.name}")
                 return result
 
         result = tool.execute(call)
@@ -365,7 +537,18 @@ class AgentWorker(QThread):
                 "meta": result.meta,
             }
         )
+        if not result.ok:
+            write_log(f"[agent_tool_error] {call.name}: {result.output}")
         return result
+
+    def _report_parser_error(self, error: str) -> None:
+        call = ToolCall(name="parser_error", args={"error": error}, raw="")
+        payload = {"id": call.id, "name": call.name, "args": call.args}
+        result = ToolResult.error(error)
+        self.tool_started.emit(payload)
+        self.tool_finished.emit({**payload, "ok": False, "output": result.output, "title": "Tool parser"})
+        self.chunk_received.emit(f"\n[Ошибка разбора tool call: {error}]\n")
+        write_log(f"[agent_parser_error] {error}")
 
     def _run_auto_tests_after_change(self) -> ToolResult | None:
         command = self._detect_test_command()

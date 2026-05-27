@@ -21,7 +21,7 @@ class ApplyPatchTool(Tool):
         try:
             self._validate_patch_paths(patch)
             proc = subprocess.run(
-                ["git", "apply", "--whitespace=nowarn"],
+                ["git", "apply", "--whitespace=nowarn", "--ignore-space-change"],
                 cwd=self.project_root,
                 input=patch,
                 stdout=subprocess.PIPE,
