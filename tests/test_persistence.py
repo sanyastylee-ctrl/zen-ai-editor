@@ -113,7 +113,7 @@ class ChatSessionStoreTests(unittest.TestCase):
         for i in range(25):
             store.save_profile("coder", "Кодер", [{"role": "assistant", "text": f"answer-{i}"}], [])
 
-        path = next(self.chats.glob("*.json"))
+        path = next(path for path in self.chats.glob("*.json") if path.name != "index.json")
         data = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(data["messages"][-1]["content"], "answer-24")
@@ -127,7 +127,7 @@ class ChatSessionStoreTests(unittest.TestCase):
             [],
         )
 
-        path = next(self.chats.glob("*.json"))
+        path = next(path for path in self.chats.glob("*.json") if path.name != "index.json")
         data = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(data["messages"][0]["role"], "tool")
@@ -139,6 +139,79 @@ class ChatSessionStoreTests(unittest.TestCase):
         with mock.patch("core.chat_store.atomic_write_json", return_value=False):
             store.save_profile("coder", "Кодер", [{"role": "user", "text": "x"}], [])
             store.set_last_profile_id("coder")
+
+    def test_create_list_save_load_session_by_profile_kind(self):
+        store = chat_store.ChatSessionStore()
+        session = store.create_session("coder", "Coder test", "C:/tmp/project", profile_id="coder-profile")
+        store.save_message(session.id, {"role": "user", "text": "hello"})
+        store.save_message(session.id, {"role": "assistant", "text": "world"})
+
+        sessions = chat_store.ChatSessionStore().list_sessions("coder")
+        records, history = chat_store.ChatSessionStore().load_session(session.id)
+
+        self.assertEqual([s.title for s in sessions], ["Coder test"])
+        self.assertEqual([r["text"] for r in records], ["hello", "world"])
+        self.assertEqual(history, [("hello", "world")])
+
+    def test_last_active_session_is_tracked_per_profile_kind(self):
+        store = chat_store.ChatSessionStore()
+        coder = store.create_session("coder", "Coder chat", profile_id="coder-profile")
+        lera = store.create_session("companion", "Lera chat", profile_id="lera-profile")
+
+        fresh = chat_store.ChatSessionStore()
+
+        self.assertEqual(fresh.get_last_active_session("coder", profile_id="coder-profile"), coder.id)
+        self.assertEqual(fresh.get_last_active_session("companion", profile_id="lera-profile"), lera.id)
+
+    def test_delete_and_clear_session(self):
+        store = chat_store.ChatSessionStore()
+        session = store.create_session("researcher", "Research")
+        store.save_message(session.id, {"role": "user", "text": "query"})
+
+        store.clear_session(session.id)
+        records, _ = store.load_session(session.id)
+        self.assertEqual(records, [])
+
+        store.delete_session(session.id)
+        self.assertEqual(store.list_sessions("researcher"), [])
+        self.assertEqual(store.load_session(session.id), ([], []))
+
+    def test_rename_session_updates_index_without_loading_messages(self):
+        store = chat_store.ChatSessionStore()
+        session = store.create_session("coder", "Old")
+        store.save_message(session.id, {"role": "user", "text": "x" * 1000})
+
+        store.rename_session(session.id, "New")
+        sessions = chat_store.ChatSessionStore().list_sessions("coder")
+
+        self.assertEqual(sessions[0].title, "New")
+
+    def test_index_listing_does_not_read_session_files(self):
+        store = chat_store.ChatSessionStore()
+        store.create_session("coder", "Indexed only")
+
+        original_read_json = chat_store.read_json
+
+        def fail_on_session_file(path, default=None):
+            if str(path).endswith(".json") and Path(path).name != "index.json" and Path(path) != chat_store._STATE_FILE:
+                raise AssertionError("session file should not be read for list_sessions")
+            return original_read_json(path, default)
+
+        with mock.patch("core.chat_store.read_json", side_effect=fail_on_session_file):
+            sessions = chat_store.ChatSessionStore().list_sessions("coder")
+
+        self.assertEqual(len(sessions), 1)
+
+    def test_load_session_limits_initial_render_to_last_messages(self):
+        store = chat_store.ChatSessionStore()
+        session = store.create_session("companion", "Long")
+        for i in range(75):
+            store.save_message(session.id, {"role": "user", "text": f"user-{i}"})
+
+        records, _ = store.load_session(session.id, message_limit=50)
+
+        self.assertEqual(len(records), 50)
+        self.assertEqual(records[0]["text"], "user-25")
 
 
 class SessionManagerTests(unittest.TestCase):

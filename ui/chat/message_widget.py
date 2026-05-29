@@ -152,10 +152,11 @@ class MessageWidget(QFrame):
             QSizePolicy.Policy.Maximum,
         )
         if is_user:
-            self._card.setMinimumWidth(120)
-            self._card.setMaximumWidth(660)
+            self._card.setMinimumWidth(136)
+            self._card.setMaximumWidth(500)
         elif record.get("role") == "assistant":
-            self._card.setMaximumWidth(860)
+            self._card.setMinimumWidth(220)
+            self._card.setMaximumWidth(620)
         elif record.get("role") == "tool":
             # tool-карточка не должна тянуться простынёй на всю ширину
             self._card.setMaximumWidth(560)
@@ -166,8 +167,8 @@ class MessageWidget(QFrame):
 
         card_layout = QVBoxLayout(self._card)
         card_layout.setContentsMargins(
-            Spacing.CARD_PADDING, Spacing.CARD_PADDING - 4,
-            Spacing.CARD_PADDING, Spacing.CARD_PADDING,
+            13, 10,
+            13, 11,
         )
         card_layout.setSpacing(6)
         self._card_layout = card_layout

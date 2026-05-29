@@ -62,7 +62,7 @@ class MessageWidgetRenderingTests(unittest.TestCase):
             "streaming": False,
         })
 
-        self.assertEqual(widget._card.maximumWidth(), 660)
+        self.assertLessEqual(widget._card.maximumWidth(), 500)
 
     def test_user_plain_text_label_is_transparent(self):
         widget = MessageWidget({

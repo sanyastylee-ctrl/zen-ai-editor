@@ -26,7 +26,8 @@ from PyQt6.QtGui import QFileSystemModel, QFont, QKeySequence, QShortcut, QActio
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QFrame, QTreeView, QTabWidget,
-    QLabel, QProgressBar, QFileDialog, QMessageBox, QMenu, QSizePolicy
+    QLabel, QProgressBar, QFileDialog, QMessageBox, QMenu, QSizePolicy,
+    QComboBox, QInputDialog, QScrollArea, QApplication
 )
 
 from core.profiles import ProfileManager, ProfileKind, AIProfile
@@ -97,6 +98,7 @@ class ZenEditor(QMainWindow):
         self._current_assistant_kind = ""
         self._agent_tool_records: dict[str, tuple[str, dict]] = {}
         self._agent_continuation_by_profile: dict[str, dict] = {}
+        self._pending_research_confirmation: dict | None = None
         self.workspace_visible = False
         self.workspace_pinned = False
         self.active_workspace_tab = "editor"
@@ -111,6 +113,7 @@ class ZenEditor(QMainWindow):
         self._histories: dict[str, list[tuple[str, str]]] = {}
         # Визуальные записи чата для ChatView (по профилю).
         self._chat_records: dict[str, list[dict]] = {}
+        self._active_session_by_profile: dict[str, str] = {}
         self._chat_store = ChatSessionStore()
         self._restore_chat_sessions()
 
@@ -145,8 +148,16 @@ class ZenEditor(QMainWindow):
         first_active = restored_active or active_coder or active_companion or active_researcher
         if first_active:
             self.profile_switcher.set_profiles(self._main_switcher_profiles(), first_active.id)
-            self._refresh_chat_view(first_active.id)
+            self._load_active_chat_session(first_active.id)
             self._chat_store.set_last_profile_id(first_active.id)
+            if first_active.kind == ProfileKind.CODER:
+                self.chat_input.setPlaceholderText("Запрос к кодеру…")
+                self._show_workspace("editor", "Файл не открыт")
+            elif first_active.kind == ProfileKind.COMPANION:
+                self.chat_input.setPlaceholderText(f"Написать {first_active.name}…")
+            elif first_active.kind == ProfileKind.RESEARCHER:
+                self.chat_input.setPlaceholderText("Что найти?..")
+                self._show_workspace("sources", "Источники")
         self._update_token_bar()
 
         # Заголовок и статус с именем проекта
@@ -167,6 +178,7 @@ class ZenEditor(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setHandleWidth(3)
         main_layout.addWidget(self.main_splitter)
 
         self.main_splitter.addWidget(self._build_sidebar())
@@ -304,20 +316,89 @@ class ZenEditor(QMainWindow):
 
         # --- WORK SPLITTER ---
         self.work_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.work_splitter.setObjectName("work_splitter")
+        self.work_splitter.setHandleWidth(3)
         layout.addWidget(self.work_splitter, 1)
 
+        self.work_splitter.addWidget(self._build_chat_sidebar())
         self.work_splitter.addWidget(self._build_chat_zone())
         workspace = self._build_editor_zone()
         self.work_splitter.addWidget(workspace)
         workspace.setVisible(False)
-        self.work_splitter.setSizes([900, 420])
+        self.work_splitter.setSizes([260, 820, 420])
 
         return right
 
+    def _build_chat_sidebar(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("chat_sidebar")
+        panel.setMinimumWidth(250)
+        panel.setMaximumWidth(288)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("Чаты")
+        title.setObjectName("chatSidebarTitle")
+        header.addWidget(title)
+        header.addStretch()
+
+        self.new_chat_btn = QPushButton("+ Новый чат")
+        self.new_chat_btn.setObjectName("chatNewButton")
+        self.new_chat_btn.setToolTip("Создать новый чат для текущего профиля")
+        self.new_chat_btn.clicked.connect(self.new_chat)
+        header.addWidget(self.new_chat_btn)
+        layout.addLayout(header)
+
+        self.chat_sidebar_scroll = QScrollArea()
+        self.chat_sidebar_scroll.setWidgetResizable(True)
+        self.chat_sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_sidebar_inner = QWidget()
+        self.chat_sidebar_inner.setObjectName("chat_sidebar_inner")
+        self.chat_sidebar_scroll.setWidget(self.chat_sidebar_inner)
+        self.chat_sidebar_list_layout = QVBoxLayout(self.chat_sidebar_inner)
+        self.chat_sidebar_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_sidebar_list_layout.setSpacing(6)
+        self.chat_sidebar_list_layout.addStretch(1)
+        layout.addWidget(self.chat_sidebar_scroll, 1)
+
+        return panel
+
     def _build_chat_zone(self) -> QWidget:
         zone = QWidget()
+        zone.setObjectName("chat_zone")
         layout = QVBoxLayout(zone)
-        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(8)
+
+        header = QFrame()
+        header.setObjectName("chat_header")
+        header.setMaximumHeight(52)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(13, 7, 10, 7)
+        header_layout.setSpacing(8)
+        header_text = QVBoxLayout()
+        header_text.setContentsMargins(0, 0, 0, 0)
+        header_text.setSpacing(1)
+        self.chat_header_title_label = QLabel("Чат")
+        self.chat_header_title_label.setObjectName("chatHeaderTitle")
+        # Compatibility alias for older UI tests/helpers; the label now holds
+        # only the profile name, not a profile/session breadcrumb.
+        self.chat_header_label = self.chat_header_title_label
+        header_text.addWidget(self.chat_header_title_label)
+        self.chat_header_subtitle_label = QLabel("")
+        self.chat_header_subtitle_label.setObjectName("chatHeaderSubtitle")
+        header_text.addWidget(self.chat_header_subtitle_label)
+        header_layout.addLayout(header_text, 1)
+        self.chat_header_menu_btn = QPushButton("⋯")
+        self.chat_header_menu_btn.setObjectName("secondaryCompact")
+        self.chat_header_menu_btn.setFixedWidth(34)
+        self.chat_header_menu_btn.setToolTip("Действия текущего чата")
+        self.chat_header_menu_btn.clicked.connect(self._show_current_chat_menu)
+        header_layout.addWidget(self.chat_header_menu_btn)
+        layout.addWidget(header)
 
         self.chat_view = ChatView()
         self.chat_view.insert_requested.connect(self._insert_code_from_chat)
@@ -328,31 +409,56 @@ class ZenEditor(QMainWindow):
         layout.addWidget(self.agent_progress)
 
         # ввод
-        input_row = QHBoxLayout()
-        input_row.setSpacing(6)
+        input_panel = QFrame()
+        input_panel.setObjectName("chat_input_bar")
+        input_panel.setMinimumHeight(52)
+        input_panel.setMaximumWidth(840)
+        input_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.chat_input_bar = input_panel
+        input_row = QHBoxLayout(input_panel)
+        input_row.setContentsMargins(12, 9, 12, 9)
+        input_row.setSpacing(10)
 
         self.attach_btn = QPushButton("📎")
-        self.attach_btn.setObjectName("secondary")
+        self.attach_btn.setObjectName("composerIconButton")
         self.attach_btn.setFixedWidth(36)
+        self.attach_btn.setMinimumHeight(34)
         self.attach_btn.setToolTip("Прикрепить файл к запросу")
         self.attach_btn.clicked.connect(self.attach_file)
         input_row.addWidget(self.attach_btn)
 
         self.chat_input = QLineEdit()
         self.chat_input.setPlaceholderText("Сообщение... (Enter)")
+        self.chat_input.setMinimumHeight(34)
+        self.chat_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.chat_input.returnPressed.connect(self._on_send_enter)
         self.chat_input.textChanged.connect(self._update_token_bar)
         input_row.addWidget(self.chat_input)
 
+        self.send_btn = QPushButton("➤")
+        self.send_btn.setObjectName("composerSendButton")
+        self.send_btn.setFixedWidth(36)
+        self.send_btn.setMinimumHeight(34)
+        self.send_btn.setToolTip("Отправить сообщение")
+        self.send_btn.clicked.connect(self._on_send_clicked)
+        input_row.addWidget(self.send_btn)
+
         self.stop_btn = QPushButton("⏹")
         self.stop_btn.setObjectName("stop_btn")
         self.stop_btn.setFixedWidth(36)
+        self.stop_btn.setMinimumHeight(34)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setToolTip("Остановить генерацию")
         self.stop_btn.clicked.connect(self.stop_generation)
         input_row.addWidget(self.stop_btn)
 
-        layout.addLayout(input_row)
+        input_wrap = QHBoxLayout()
+        input_wrap.setContentsMargins(0, 0, 0, 0)
+        input_wrap.setSpacing(0)
+        input_wrap.addStretch(1)
+        input_wrap.addWidget(input_panel, 8)
+        input_wrap.addStretch(1)
+        layout.addLayout(input_wrap)
 
         # прикреплённые файлы — список под полем ввода
         self.attached_files: list[str] = []
@@ -374,7 +480,10 @@ class ZenEditor(QMainWindow):
         panel_layout.setContentsMargins(10, 10, 10, 10)
         panel_layout.setSpacing(8)
 
-        head = QHBoxLayout()
+        head_frame = QFrame()
+        head_frame.setObjectName("workspace_header")
+        head = QHBoxLayout(head_frame)
+        head.setContentsMargins(10, 7, 8, 7)
         head.setSpacing(8)
         self.workspace_title_label = QLabel("Workspace")
         self.workspace_title_label.setObjectName("workspace_title")
@@ -397,10 +506,10 @@ class ZenEditor(QMainWindow):
         self.workspace_hide_btn.clicked.connect(self._hide_workspace_manual)
         head.addWidget(self.workspace_hide_btn)
 
-        panel_layout.addLayout(head)
+        panel_layout.addWidget(head_frame)
 
         tabs = QTabWidget()
-        tabs.setTabPosition(QTabWidget.TabPosition.South)
+        tabs.setTabPosition(QTabWidget.TabPosition.North)
 
         if QSCI_AVAILABLE:
             self.code_editor = make_scintilla_editor()
@@ -434,13 +543,34 @@ class ZenEditor(QMainWindow):
         self.sandbox = SandboxWidget()
         tabs.addTab(self.sandbox, "Терминал")
 
+        sources_page = QWidget()
+        sources_layout = QVBoxLayout(sources_page)
+        sources_layout.setContentsMargins(0, 0, 0, 0)
+        sources_layout.setSpacing(0)
+        self.sources_scroll = QScrollArea()
+        self.sources_scroll.setObjectName("sourcesScroll")
+        self.sources_scroll.setWidgetResizable(True)
+        self.sources_container = QWidget()
+        self.sources_container.setObjectName("sourcesContainer")
+        self.sources_list_layout = QVBoxLayout(self.sources_container)
+        self.sources_list_layout.setContentsMargins(8, 8, 8, 8)
+        self.sources_list_layout.setSpacing(8)
+        self.sources_empty_label = QLabel("Источники появятся после web-поиска.")
+        self.sources_empty_label.setObjectName("workspace_empty")
+        self.sources_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sources_empty_label.setWordWrap(True)
+        self.sources_list_layout.addWidget(self.sources_empty_label, 1)
+        self.sources_scroll.setWidget(self.sources_container)
+        sources_layout.addWidget(self.sources_scroll, 1)
+        tabs.addTab(sources_page, "Sources")
+
         self._editor_tabs = tabs
         panel_layout.addWidget(tabs, 1)
         self.workspace_panel = panel
         return panel
 
     def _workspace_tab_index(self, tab: str) -> int:
-        return {"editor": 0, "terminal": 1}.get(tab, 0)
+        return {"editor": 0, "terminal": 1, "sources": 2}.get(tab, 0)
 
     def _toggle_workspace_tab(self, tab: str) -> None:
         """
@@ -461,7 +591,7 @@ class ZenEditor(QMainWindow):
             if hasattr(self, "workspace_pin_btn"):
                 self.workspace_pin_btn.setChecked(True)
                 self.workspace_pin_btn.setText("Pinned")
-            label = "Терминал" if tab == "terminal" else "Редактор"
+            label = "Источники" if tab == "sources" else ("Терминал" if tab == "terminal" else "Редактор")
             self._show_workspace(tab, label)
         self._sync_workspace_toggle_buttons()
 
@@ -486,11 +616,13 @@ class ZenEditor(QMainWindow):
         self.auto_open_reason = reason or ""
         self.workspace_panel.setVisible(True)
         self._editor_tabs.setCurrentIndex(self._workspace_tab_index(tab))
+        if hasattr(self, "workspace_title_label"):
+            self.workspace_title_label.setText("Sources" if tab == "sources" else "Workspace")
         if hasattr(self, "workspace_reason_label"):
-            self.workspace_reason_label.setText(reason or ("Терминал" if tab == "terminal" else "Редактор"))
+            self.workspace_reason_label.setText(reason or ("Источники" if tab == "sources" else ("Терминал" if tab == "terminal" else "Редактор")))
         # Если панель была скрыта, splitter не всегда возвращает ей место сам.
         if hasattr(self, "work_splitter"):
-            self.work_splitter.setSizes([820, 460])
+            self.work_splitter.setSizes([260, 760, 460])
         self._sync_workspace_toggle_buttons()
 
     def _hide_workspace_manual(self) -> None:
@@ -539,6 +671,85 @@ class ZenEditor(QMainWindow):
         self._show_workspace("editor", reason)
         return True
 
+    def _clear_research_sources(self) -> None:
+        self._render_research_sources([])
+
+    def _render_research_sources(self, sources: list[dict]) -> None:
+        if not hasattr(self, "sources_list_layout"):
+            return
+        while self.sources_list_layout.count():
+            item = self.sources_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if not sources:
+            self.sources_empty_label = QLabel("Источники появятся после web-поиска.")
+            self.sources_empty_label.setObjectName("workspace_empty")
+            self.sources_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.sources_empty_label.setWordWrap(True)
+            self.sources_list_layout.addWidget(self.sources_empty_label, 1)
+            return
+        for source in sources:
+            self.sources_list_layout.addWidget(self._make_source_card(source))
+        self.sources_list_layout.addStretch(1)
+
+    def _make_source_card(self, source: dict) -> QFrame:
+        card = QFrame()
+        card.setObjectName("sourceCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(6)
+
+        title_row = QHBoxLayout()
+        title = QLabel(str(source.get("title") or source.get("url") or "Источник"))
+        title.setObjectName("sourceTitle")
+        title.setWordWrap(True)
+        title_row.addWidget(title, 1)
+
+        status = str(source.get("status") or "")
+        read_ok = bool(source.get("read_ok"))
+        if read_ok:
+            status_text = "read"
+            status_kind = "read"
+        elif status == "failed":
+            status_text = "failed"
+            status_kind = "failed"
+        else:
+            status_text = "snippet only"
+            status_kind = "snippet"
+        badge = QLabel(status_text)
+        badge.setObjectName("sourceStatus")
+        badge.setProperty("status", status_kind)
+        title_row.addWidget(badge)
+        layout.addLayout(title_row)
+
+        url = str(source.get("url") or "")
+        domain = str(source.get("domain") or url)
+        meta = QLabel(domain)
+        meta.setObjectName("sourceMeta")
+        meta.setWordWrap(True)
+        layout.addWidget(meta)
+
+        excerpt = str(source.get("excerpt") or source.get("snippet") or source.get("failure_reason") or "").strip()
+        if excerpt:
+            body = QLabel(excerpt[:700] + ("..." if len(excerpt) > 700 else ""))
+            body.setObjectName("sourceExcerpt")
+            body.setWordWrap(True)
+            layout.addWidget(body)
+
+        actions = QHBoxLayout()
+        score = source.get("relevance_score", 0)
+        score_label = QLabel(f"relevance {float(score):.2f}" if score else "relevance n/a")
+        score_label.setObjectName("sourceMeta")
+        actions.addWidget(score_label, 1)
+        copy_btn = QPushButton("Copy URL")
+        copy_btn.setObjectName("secondaryCompact")
+        copy_btn.clicked.connect(lambda _=False, value=url: QApplication.clipboard().setText(value))
+        actions.addWidget(copy_btn)
+        layout.addLayout(actions)
+        return card
+
     def _tool_path_to_project_file(self, path: str) -> str:
         if not path:
             return ""
@@ -558,6 +769,8 @@ class ZenEditor(QMainWindow):
 
     def _on_profile_changed(self, profile_id: str) -> None:
         """Юзер кликнул на другой профиль в свитчере."""
+        started = datetime.now()
+        write_log(f'[profile_switch_start] profile_id="{self._quote_log(profile_id)}"')
         profile = self.pm.get(profile_id)
         if not profile:
             return
@@ -566,27 +779,32 @@ class ZenEditor(QMainWindow):
         # обновляем активный для слота профиля
         self.pm.set_active(profile.kind, profile_id)
 
-        # выгружаем все остальные модели (max_loaded=1, но на всякий случай)
-        # Это даст явный фидбэк "переключаюсь"
-        mm = ModelManager.instance()
-        target_path = resolve_model_path(profile.model_file)
-        for loaded_path in mm.loaded():
-            if loaded_path != target_path:
-                mm.unload(loaded_path)
-
-        # переключаем вид чата на историю этого профиля
-        self._refresh_chat_view(profile_id)
+        # Переключение профиля должно быть UI-only. Модель грузится/выгружается
+        # только при реальной генерации, иначе простой клик по Лере/Кодеру
+        # ощущается как зависание.
+        self._load_active_chat_session(profile_id)
         self._update_token_bar()
 
         # обновляем плейсхолдер ввода под тип профиля
         if profile.kind == ProfileKind.CODER:
-            self.chat_input.setPlaceholderText("Запрос к кодеру (Enter)")
+            self.chat_input.setPlaceholderText("Запрос к кодеру…")
+            if not self.workspace_visible:
+                self._show_workspace("editor", "Файл не открыт")
         elif profile.kind == ProfileKind.COMPANION:
-            self.chat_input.setPlaceholderText(f"Написать {profile.name}... (Enter)")
+            self.chat_input.setPlaceholderText(f"Написать {profile.name}…")
+            if not getattr(self, "workspace_pinned", False):
+                self._hide_workspace()
         elif profile.kind == ProfileKind.RESEARCHER:
-            self.chat_input.setPlaceholderText("Спросить Поисковик... (Enter)")
+            self.chat_input.setPlaceholderText("Что найти?..")
+            if not getattr(self, "workspace_pinned", False):
+                self._show_workspace("sources", "Источники")
         else:
             self.chat_input.setPlaceholderText("Сообщение... (Enter)")
+        elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
+        write_log(
+            "[profile_switch_done] "
+            f'profile_id="{self._quote_log(profile_id)}" elapsed_ms="{elapsed_ms}"'
+        )
 
     def _active_profile(self) -> AIProfile | None:
         pid = self.profile_switcher.active_id()
@@ -602,12 +820,10 @@ class ZenEditor(QMainWindow):
     # ============================================================
 
     def _restore_chat_sessions(self) -> None:
-        for profile in self.pm.all():
-            records, history = self._chat_store.load_profile(profile.id)
-            if records:
-                self._chat_records[profile.id] = records
-            if history:
-                self._histories[profile.id] = history
+        # Do not load every chat transcript at startup. The active session for
+        # a profile is loaded lazily when the profile is shown.
+        self._chat_records = {}
+        self._histories = {}
 
     def _persist_chat_session(self, profile_id: str) -> None:
         profile = self.pm.get(profile_id)
@@ -619,6 +835,271 @@ class ZenEditor(QMainWindow):
             self._chat_records.get(profile_id, []),
             self._histories.get(profile_id, []),
         )
+
+    def _profile_session_kind(self, profile: AIProfile) -> str:
+        return profile.kind.value
+
+    def _default_chat_title(self, profile: AIProfile) -> str:
+        return self._chat_store.default_title(self._profile_session_kind(profile))
+
+    def _current_session_id(self, profile_id: str) -> str:
+        return self._active_session_by_profile.get(profile_id, "")
+
+    def _ensure_chat_session(self, profile: AIProfile) -> str:
+        kind = self._profile_session_kind(profile)
+        session_id = self._active_session_by_profile.get(profile.id)
+        if not session_id:
+            session_id = self._chat_store.get_last_active_session(kind, profile_id=profile.id)
+        if not session_id:
+            session = self._chat_store.create_session(
+                kind,
+                self._default_chat_title(profile),
+                self.projects.current,
+                profile_id=profile.id,
+            )
+            session_id = session.id
+        self._active_session_by_profile[profile.id] = session_id
+        self._chat_store.set_last_active_session(kind, session_id, profile_id=profile.id)
+        return session_id
+
+    def _load_active_chat_session(self, profile_id: str) -> None:
+        profile = self.pm.get(profile_id)
+        if profile is None:
+            return
+        session_id = self._ensure_chat_session(profile)
+        write_log(
+            "[profile_switch_loaded_session] "
+            f'profile_id="{self._quote_log(profile_id)}" session_id="{self._quote_log(session_id)}"'
+        )
+        records, history = self._chat_store.load_session(session_id, message_limit=50)
+        self._chat_records[profile_id] = records
+        self._histories[profile_id] = history
+        self._refresh_session_combo(profile_id)
+        self._update_chat_header(profile_id)
+        write_log(f'[profile_switch_render_start] profile_id="{self._quote_log(profile_id)}" messages="{len(records)}"')
+        self._refresh_chat_view(profile_id)
+        write_log(f'[profile_switch_render_done] profile_id="{self._quote_log(profile_id)}" messages="{len(records)}"')
+
+    def _refresh_session_combo(self, profile_id: str) -> None:
+        self._refresh_chat_sidebar(profile_id)
+
+    def _refresh_chat_sidebar(self, active_profile_id: str | None = None) -> None:
+        if not hasattr(self, "chat_sidebar_list_layout"):
+            return
+        while self.chat_sidebar_list_layout.count() > 1:
+            item = self.chat_sidebar_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        active_profile_id = active_profile_id or (self.profile_switcher.active_id() if hasattr(self, "profile_switcher") else "")
+        active_session_id = self._current_session_id(active_profile_id) if active_profile_id else ""
+        for profile in self._main_switcher_profiles():
+            group = QLabel(profile.name)
+            group.setObjectName("chatSidebarGroup")
+            self.chat_sidebar_list_layout.insertWidget(self.chat_sidebar_list_layout.count() - 1, group)
+            sessions = self._chat_store.list_sessions(self._profile_session_kind(profile))
+            if not sessions:
+                empty = QLabel("Нет чатов")
+                empty.setObjectName("chatSidebarEmpty")
+                self.chat_sidebar_list_layout.insertWidget(self.chat_sidebar_list_layout.count() - 1, empty)
+                continue
+            for session in sessions:
+                row = QFrame()
+                row.setObjectName("chatSessionRow")
+                row.setProperty("active", "true" if session.id == active_session_id else "false")
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                row.mousePressEvent = lambda event, pid=profile.id, sid=session.id: self._open_chat_session(pid, sid)
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(9, 8, 6, 8)
+                row_layout.setSpacing(7)
+                text_col = QVBoxLayout()
+                text_col.setContentsMargins(0, 0, 0, 0)
+                text_col.setSpacing(2)
+                title_label = QLabel(session.title)
+                title_label.setObjectName("chatSessionTitle")
+                title_label.setWordWrap(False)
+                title_label.setToolTip(session.title)
+                text_col.addWidget(title_label)
+                if session.last_message_preview:
+                    preview_label = QLabel(session.last_message_preview)
+                    preview_label.setObjectName("chatSessionPreview")
+                    preview_label.setWordWrap(False)
+                    preview_label.setToolTip(session.last_message_preview)
+                    text_col.addWidget(preview_label)
+                row_layout.addLayout(text_col, 1)
+                menu_btn = QPushButton("⋯")
+                menu_btn.setObjectName("chatSessionMenuButton")
+                menu_btn.setFixedWidth(26)
+                menu_btn.setToolTip("Действия чата")
+                menu_btn.clicked.connect(lambda _, pid=profile.id, sid=session.id: self._show_session_menu(pid, sid))
+                row_layout.addWidget(menu_btn)
+                self.chat_sidebar_list_layout.insertWidget(self.chat_sidebar_list_layout.count() - 1, row)
+        write_log("[chat_sidebar_render]")
+
+    def _open_chat_session(self, profile_id: str, session_id: str) -> None:
+        profile = self.pm.get(profile_id)
+        if profile is None:
+            return
+        write_log(
+            "[chat_session_open] "
+            f'profile_id="{self._quote_log(profile_id)}" session_id="{self._quote_log(session_id)}"'
+        )
+        self._active_session_by_profile[profile_id] = str(session_id)
+        self._chat_store.set_last_active_session(
+            self._profile_session_kind(profile),
+            str(session_id),
+            profile_id=profile_id,
+        )
+        if self.profile_switcher.active_id() != profile_id:
+            self.profile_switcher.set_active(profile_id)
+            self._on_profile_changed(profile_id)
+        else:
+            self._load_active_chat_session(profile_id)
+
+    def _on_chat_session_changed(self, index: int) -> None:
+        if index < 0 or not hasattr(self, "chat_session_combo"):
+            return
+        profile = self._active_profile()
+        if profile is None:
+            return
+        session_id = self.chat_session_combo.itemData(index)
+        if not session_id or session_id == self._current_session_id(profile.id):
+            return
+        self._active_session_by_profile[profile.id] = str(session_id)
+        self._chat_store.set_last_active_session(
+            self._profile_session_kind(profile),
+            str(session_id),
+            profile_id=profile.id,
+        )
+        self._load_active_chat_session(profile.id)
+
+    def new_chat(self) -> None:
+        profile = self._active_profile()
+        if profile is None:
+            return
+        title = self._default_chat_title(profile)
+        session = self._chat_store.create_session(
+            self._profile_session_kind(profile),
+            title,
+            self.projects.current,
+            profile_id=profile.id,
+        )
+        self._active_session_by_profile[profile.id] = session.id
+        self._chat_records[profile.id] = []
+        self._histories[profile.id] = []
+        self._refresh_session_combo(profile.id)
+        self._update_chat_header(profile.id)
+        self._refresh_chat_view(profile.id)
+        write_log(f'[chat_session_action] action="new" session_id="{self._quote_log(session.id)}"')
+
+    def rename_current_chat(self) -> None:
+        profile = self._active_profile()
+        if profile is None:
+            return
+        session_id = self._ensure_chat_session(profile)
+        current_title = self._session_title(session_id)
+        title, ok = QInputDialog.getText(self, "Переименовать чат", "Название:", text=current_title)
+        if not ok:
+            return
+        self._rename_session(profile.id, session_id, title.strip())
+
+    def clear_current_chat(self) -> None:
+        profile = self._active_profile()
+        if profile is None:
+            return
+        self._clear_session(profile.id, self._ensure_chat_session(profile))
+
+    def delete_current_chat(self) -> None:
+        profile = self._active_profile()
+        if profile is None:
+            return
+        self._delete_session(profile.id, self._ensure_chat_session(profile))
+
+    def _rename_session(self, profile_id: str, session_id: str, title: str) -> None:
+        self._chat_store.rename_session(session_id, title)
+        self._refresh_session_combo(profile_id)
+        self._update_chat_header(profile_id)
+        write_log(f'[chat_session_action] action="rename" session_id="{self._quote_log(session_id)}"')
+
+    def _clear_session(self, profile_id: str, session_id: str) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Очистить чат",
+            "Удалить все сообщения в текущем чате?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._chat_store.clear_session(session_id)
+        if self._current_session_id(profile_id) == session_id:
+            self._chat_records[profile_id] = []
+            self._histories[profile_id] = []
+            self._refresh_chat_view(profile_id)
+        self._refresh_session_combo(profile_id)
+        self._update_chat_header(profile_id)
+        write_log(f'[chat_session_action] action="clear" session_id="{self._quote_log(session_id)}"')
+
+    def _delete_session(self, profile_id: str, session_id: str) -> None:
+        profile = self.pm.get(profile_id)
+        if profile is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Удалить чат",
+            "Удалить текущий чат? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._chat_store.delete_session(session_id)
+        self._active_session_by_profile.pop(profile.id, None)
+        self._load_active_chat_session(profile.id)
+        write_log(f'[chat_session_action] action="delete" session_id="{self._quote_log(session_id)}"')
+
+    def _show_current_chat_menu(self) -> None:
+        profile = self._active_profile()
+        if profile is None:
+            return
+        self._show_session_menu(profile.id, self._ensure_chat_session(profile))
+
+    def _show_session_menu(self, profile_id: str, session_id: str) -> None:
+        menu = QMenu(self)
+        rename = menu.addAction("Переименовать")
+        clear = menu.addAction("Очистить сообщения")
+        delete = menu.addAction("Удалить чат")
+        action = menu.exec(self.cursor().pos())
+        if action == rename:
+            title, ok = QInputDialog.getText(self, "Переименовать чат", "Название:", text=self._session_title(session_id))
+            if ok:
+                self._rename_session(profile_id, session_id, title.strip())
+        elif action == clear:
+            self._clear_session(profile_id, session_id)
+        elif action == delete:
+            self._delete_session(profile_id, session_id)
+
+    def _session_title(self, session_id: str) -> str:
+        for profile in self._main_switcher_profiles():
+            for session in self._chat_store.list_sessions(self._profile_session_kind(profile)):
+                if session.id == session_id:
+                    return session.title
+        return "Чат"
+
+    def _update_chat_header(self, profile_id: str) -> None:
+        if not hasattr(self, "chat_header_title_label"):
+            return
+        profile = self.pm.get(profile_id)
+        if profile is None:
+            self.chat_header_title_label.setText("Чат")
+            self.chat_header_subtitle_label.setText("")
+            return
+        session_id = self._current_session_id(profile_id)
+        title = self._session_title(session_id)
+        project_name = os.path.basename(os.path.normpath(self.projects.current)) if getattr(self, "projects", None) else ""
+        suffix = f" · {project_name}" if project_name else ""
+        self.chat_header_title_label.setText(profile.name)
+        self.chat_header_subtitle_label.setText(f"{title}{suffix}")
 
     def _get_project_tree(self, root_dir: str, max_depth: int = 2) -> str:
         """Создает текстовую карту проекта для ИИ (игнорирует мусор)."""
@@ -665,16 +1146,26 @@ class ZenEditor(QMainWindow):
         })
 
     def _add_chat_record(self, profile_id: str, record: dict) -> None:
+        profile = self.pm.get(profile_id)
+        if profile is not None:
+            self._ensure_chat_session(profile)
         record.setdefault("time", datetime.now().isoformat(timespec="minutes"))
+        record.setdefault("id", f"msg_{datetime.now().timestamp():.6f}_{len(self._chat_records.get(profile_id, []))}")
         records = self._chat_records.setdefault(profile_id, [])
         records.append(record)
         if self.profile_switcher.active_id() == profile_id:
             self.chat_view.add_record(record)
-        self._persist_chat_session(profile_id)
+        session_id = self._current_session_id(profile_id)
+        if session_id:
+            self._chat_store.save_message(session_id, record)
+            self._refresh_session_combo(profile_id)
 
     def _update_chat_record(self, profile_id: str, record: dict) -> None:
         if self.profile_switcher.active_id() == profile_id:
             self.chat_view.update_record(record)
+        session_id = self._current_session_id(profile_id)
+        if session_id:
+            self._chat_store.update_message(session_id, record)
 
     def _quote_log(self, value: object, limit: int = 240) -> str:
         text = str(value)
@@ -921,6 +1412,7 @@ class ZenEditor(QMainWindow):
         history: list[tuple[str, str]],
         attached_paths: list[str],
         visual_context: str = "",
+        confirmed_research_outbound: bool = False,
     ) -> None:
         if profile.kind != ProfileKind.VISION:
             image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -968,9 +1460,13 @@ class ZenEditor(QMainWindow):
             self.worker.agent_finished.connect(self._on_agent_finished)
             self.worker.confirmation_requested.connect(self._on_agent_confirmation_requested)
         elif profile.kind == ProfileKind.RESEARCHER and self._research_requires_pipeline(profile, full_text):
+            self._clear_research_sources()
+            if not getattr(self, "workspace_pinned", False):
+                self._show_workspace("sources", "Источники")
             self.worker = ResearchWorker(
                 profile=profile,
                 user_message=full_text,
+                confirmed_outbound=confirmed_research_outbound,
             )
         else:
             self.worker = InferenceWorker(
@@ -983,6 +1479,9 @@ class ZenEditor(QMainWindow):
                 attached_files=attached_paths,
                 allow_agent_actions=not getattr(profile, "agent_mode", False),
             )
+        if isinstance(self.worker, ResearchWorker):
+            self.worker.confirmation_required.connect(self._on_research_confirmation_required)
+            self.worker.sources_ready.connect(self._on_research_sources_ready)
         self.worker.chunk_received.connect(self._on_chunk)
         self.worker.finished_signal.connect(lambda: self._on_generation_done(profile.id, full_text))
         self.worker.model_loading.connect(lambda p: self.model_status.setText(f"Загружаю {os.path.basename(p)}..."))
@@ -1288,6 +1787,57 @@ class ZenEditor(QMainWindow):
         if self.worker and hasattr(self.worker, "resolve_confirmation"):
             self.worker.resolve_confirmation(call_id, accepted)
 
+    def _on_research_confirmation_required(self, payload: dict) -> None:
+        sanitized = str(payload.get("sanitized_query", "") or "").strip()
+        reasons = [str(reason) for reason in payload.get("reasons", []) if str(reason)]
+        profile_id = str(payload.get("profile_id", "") or "")
+        write_log(
+            "[research_confirmation_shown] "
+            f'profile_id="{self._quote_log(profile_id)}" '
+            f'reasons="{self._quote_log(",".join(reasons))}" '
+            f'sanitized="{self._quote_log(sanitized)}"'
+        )
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Подтверждение web-поиска")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("Запрос содержит потенциально приватные данные.")
+        box.setInformativeText(
+            "ZenAI не отправляет историю чата, код, память или локальные файлы в интернет.\n\n"
+            "В интернет будет отправлено только:\n"
+            f"{sanitized or '[empty]'}"
+        )
+        if reasons:
+            box.setDetailedText("Причины проверки: " + ", ".join(reasons))
+        send_button = box.addButton("Отправить обезличенный", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        accepted = box.clickedButton() == send_button
+        if accepted:
+            write_log(
+                "[research_confirmation_accepted] "
+                f'profile_id="{self._quote_log(profile_id)}" sanitized="{self._quote_log(sanitized)}"'
+            )
+        else:
+            write_log(
+                "[research_confirmation_cancelled] "
+                f'profile_id="{self._quote_log(profile_id)}" reasons="{self._quote_log(",".join(reasons))}"'
+            )
+        self._pending_research_confirmation = {
+            "accepted": accepted,
+            "profile_id": profile_id,
+            "raw_query": str(payload.get("raw_query", "") or ""),
+            "sanitized_query": sanitized,
+            "reasons": reasons,
+        }
+
+    def _on_research_sources_ready(self, sources: list) -> None:
+        safe_sources = [source for source in sources if isinstance(source, dict)]
+        self._render_research_sources(safe_sources)
+        if self._active_profile() and self._active_profile().kind == ProfileKind.RESEARCHER:
+            self._show_workspace("sources", f"{len(safe_sources)} источников")
+
     def _on_chunk(self, chunk: str) -> None:
         self._current_ai_response += chunk
         self._current_message_buffer += chunk
@@ -1376,6 +1926,14 @@ class ZenEditor(QMainWindow):
             and bool(getattr(finished_worker, "auto_continue_requested", False))
             and bool(getattr(finished_worker, "continuation_state", None))
         )
+        research_pending_confirmation = (
+            isinstance(finished_worker, ResearchWorker)
+            and bool(getattr(finished_worker, "research_pending_confirmation", False))
+        )
+        if research_pending_confirmation and self._pending_research_confirmation is None:
+            self._on_research_confirmation_required(
+                getattr(finished_worker, "research_confirmation_payload", {}) or {}
+            )
         if self._stream_update_timer.isActive():
             self._stream_update_timer.stop()
         if self._current_assistant_record is not None:
@@ -1407,7 +1965,7 @@ class ZenEditor(QMainWindow):
                 companion_invalid = True
                 if finished_worker is not None:
                     setattr(finished_worker, "companion_block_reason", "empty_response")
-        if not auto_continue:
+        if not auto_continue and not research_pending_confirmation:
             if not companion_invalid:
                 hist.append((user_msg, companion_response_text))
                 self._capture_companion_memory(profile_id, user_msg)
@@ -1421,7 +1979,7 @@ class ZenEditor(QMainWindow):
 
             if len(hist) > 50:
                 del hist[: len(hist) - 50]
-            self._persist_chat_session(profile_id)
+            self._refresh_session_combo(profile_id)
 
         if self.worker and hasattr(self.worker, "attached_files"):
             self.worker.attached_files.clear()
@@ -1445,6 +2003,39 @@ class ZenEditor(QMainWindow):
         self._current_assistant_kind = ""
         self.stop_btn.setEnabled(False)
         self.worker = None
+        if research_pending_confirmation:
+            decision = self._pending_research_confirmation or {}
+            self._pending_research_confirmation = None
+            profile = self.pm.get(profile_id)
+            if decision.get("accepted") and profile:
+                self._current_ai_response = ""
+                self._current_message_buffer = ""
+                self._current_response_profile_id = profile.id
+                self._current_assistant_sender = "Ассистент"
+                self._current_assistant_kind = profile.kind.value
+                self._current_assistant_record = None
+                self._start_generation_worker(
+                    profile=profile,
+                    full_text=str(decision.get("raw_query") or user_msg),
+                    code_context="",
+                    rag_snippets="",
+                    history=self._histories.get(profile.id, []),
+                    attached_paths=[],
+                    visual_context="",
+                    confirmed_research_outbound=True,
+                )
+                self.stop_btn.setEnabled(True)
+                self.worker.start()
+                return
+            if profile:
+                self._add_chat_record(profile.id, {
+                    "role": "assistant",
+                    "sender": "Ассистент",
+                    "text": "Web search cancelled. Ничего не отправлено.",
+                    "profile_kind": profile.kind.value,
+                    "streaming": False,
+                })
+            return
         if auto_continue:
             profile = self.pm.get(profile_id)
             if profile and getattr(profile, "auto_continue_enabled", True):
@@ -1959,6 +2550,18 @@ class ZenEditor(QMainWindow):
                 selection-background-color: rgba(167,139,250,0.28);
             }}
             QLineEdit:focus {{ border: 1px solid {Palette.ACCENT}; }}
+            QComboBox {{
+                background-color: {Palette.BG_INPUT}; color: {Palette.TEXT_PRIMARY};
+                border: 1px solid {Palette.BORDER}; border-radius: 8px;
+                padding: 5px 10px; font-size: 12px;
+            }}
+            QComboBox:hover {{ border-color: {Palette.BORDER_LIGHT}; }}
+            QComboBox::drop-down {{ border: none; width: 24px; }}
+            QComboBox QAbstractItemView {{
+                background-color: {Palette.BG_PANEL}; color: {Palette.TEXT_PRIMARY};
+                border: 1px solid {Palette.BORDER};
+                selection-background-color: rgba(167,139,250,0.24);
+            }}
             QPushButton {{
                 background-color: {Palette.ACCENT}; color: #17171C;
                 border-radius: 8px; padding: 6px 12px;
@@ -2010,6 +2613,33 @@ class ZenEditor(QMainWindow):
             }}
             QPushButton#stop_btn:enabled:hover {{ background-color: rgba(248,113,113,0.30); }}
             QPushButton#stop_btn:disabled {{ background-color: {Palette.BG_INPUT}; color: {Palette.TEXT_DIM}; }}
+            QPushButton#composerIconButton, QPushButton#composerSendButton {{
+                background-color: transparent;
+                color: {Palette.TEXT_SECONDARY};
+                border: 1px solid transparent;
+                border-radius: 9px;
+                padding: 0;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QPushButton#composerIconButton:hover {{
+                background-color: rgba(167,139,250,0.10);
+                color: {Palette.TEXT_PRIMARY};
+                border-color: {Palette.BORDER};
+            }}
+            QPushButton#composerSendButton {{
+                background-color: rgba(167,139,250,0.18);
+                color: {Palette.TEXT_PRIMARY};
+                border-color: rgba(167,139,250,0.28);
+            }}
+            QPushButton#composerSendButton:hover {{
+                background-color: rgba(167,139,250,0.28);
+                border-color: rgba(167,139,250,0.45);
+            }}
+            QPushButton#stop_btn {{
+                border-radius: 9px;
+                padding: 0;
+            }}
             QPushButton#green_btn {{
                 background-color: rgba(110,231,183,0.12);
                 color: {Palette.ACCENT_GREEN};
@@ -2021,9 +2651,119 @@ class ZenEditor(QMainWindow):
                 border: 1px solid {Palette.BORDER};
                 border-radius: 12px;
             }}
-            QLabel#workspace_title {{
+            QFrame#workspace_header {{
+                background-color: rgba(255,255,255,0.018);
+                border: 1px solid {Palette.BORDER};
+                border-radius: 9px;
+            }}
+            QWidget#chat_zone {{
+                background-color: transparent;
+            }}
+            QFrame#chat_input_bar {{
+                background-color: {Palette.BG_INPUT};
+                border: 1px solid {Palette.BORDER_LIGHT};
+                border-radius: 12px;
+            }}
+            QFrame#chat_input_bar QLineEdit {{
+                background: transparent;
+                border: none;
+                padding: 2px 4px;
+                font-size: 13px;
+                color: {Palette.TEXT_PRIMARY};
+            }}
+            QFrame#chat_sidebar {{
+                background-color: {Palette.BG_PANEL};
+                border: 1px solid {Palette.BORDER};
+                border-radius: 12px;
+            }}
+            QWidget#chat_sidebar_inner {{
+                background-color: transparent;
+            }}
+            QLabel#chatSidebarTitle {{
+                color: {Palette.TEXT_PRIMARY};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QPushButton#chatNewButton {{
+                background-color: rgba(167,139,250,0.14);
+                color: {Palette.TEXT_PRIMARY};
+                border: 1px solid rgba(167,139,250,0.28);
+                border-radius: 8px;
+                padding: 5px 10px;
+                min-height: 20px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton#chatNewButton:hover {{
+                background-color: rgba(167,139,250,0.22);
+                border-color: rgba(167,139,250,0.45);
+            }}
+            QLabel#chatSidebarGroup {{
+                color: {Palette.TEXT_DIM};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0px;
+                padding: 10px 3px 2px 3px;
+            }}
+            QLabel#chatSidebarEmpty {{
+                color: {Palette.TEXT_DIM};
+                font-size: 11px;
+                padding: 4px 8px;
+            }}
+            QFrame#chatSessionRow {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 10px;
+            }}
+            QFrame#chatSessionRow:hover {{
+                background-color: rgba(167,139,250,0.07);
+                border-color: {Palette.BORDER};
+            }}
+            QFrame#chatSessionRow[active="true"] {{
+                background-color: rgba(167,139,250,0.15);
+                border-color: rgba(167,139,250,0.42);
+            }}
+            QLabel#chatSessionTitle {{
                 color: {Palette.TEXT_PRIMARY};
                 font-size: 12px;
+                font-weight: 650;
+                background: transparent;
+            }}
+            QLabel#chatSessionPreview {{
+                color: {Palette.TEXT_DIM};
+                font-size: 11px;
+                background: transparent;
+            }}
+            QPushButton#chatSessionMenuButton {{
+                background-color: transparent;
+                color: {Palette.TEXT_DIM};
+                border: none;
+                border-radius: 6px;
+                padding: 2px;
+                font-size: 14px;
+            }}
+            QPushButton#chatSessionMenuButton:hover {{
+                background-color: rgba(167,139,250,0.12);
+                color: {Palette.TEXT_PRIMARY};
+            }}
+            QFrame#chat_header {{
+                background-color: {Palette.BG_PANEL};
+                border: 1px solid {Palette.BORDER};
+                border-radius: 10px;
+            }}
+            QLabel#chatHeaderTitle {{
+                color: {Palette.TEXT_PRIMARY};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QLabel#chatHeaderSubtitle {{
+                color: {Palette.TEXT_DIM};
+                font-size: 11px;
+                font-weight: 500;
+            }}
+            QLabel#workspace_title {{
+                color: {Palette.TEXT_PRIMARY};
+                font-size: 13px;
                 font-weight: 700;
             }}
             QLabel#workspace_reason, QLabel#token_label {{
@@ -2034,10 +2774,59 @@ class ZenEditor(QMainWindow):
                 color: {Palette.TEXT_DIM};
                 font-size: 13px;
                 line-height: 150%;
-                background: {Palette.BG_CHAT};
+                background: rgba(255,255,255,0.014);
                 border: 1px dashed {Palette.BORDER};
                 border-radius: 10px;
                 padding: 18px;
+            }}
+            QScrollArea#sourcesScroll {{
+                background-color: transparent;
+                border: none;
+            }}
+            QWidget#sourcesContainer {{
+                background-color: transparent;
+            }}
+            QFrame#sourceCard {{
+                background-color: rgba(255,255,255,0.025);
+                border: 1px solid {Palette.BORDER};
+                border-radius: 10px;
+            }}
+            QLabel#sourceTitle {{
+                color: {Palette.TEXT_PRIMARY};
+                font-size: 12px;
+                font-weight: 700;
+                background: transparent;
+            }}
+            QLabel#sourceMeta {{
+                color: {Palette.TEXT_DIM};
+                font-size: 10px;
+                background: transparent;
+            }}
+            QLabel#sourceExcerpt {{
+                color: {Palette.TEXT_SECONDARY};
+                font-size: 11px;
+                line-height: 140%;
+                background: transparent;
+            }}
+            QLabel#sourceStatus {{
+                border-radius: 8px;
+                padding: 2px 7px;
+                font-size: 10px;
+                font-weight: 700;
+                background-color: rgba(255,255,255,0.05);
+                color: {Palette.TEXT_DIM};
+            }}
+            QLabel#sourceStatus[status="read"] {{
+                background-color: rgba(110,231,183,0.12);
+                color: {Palette.ACCENT_GREEN};
+            }}
+            QLabel#sourceStatus[status="snippet"] {{
+                background-color: rgba(251,191,36,0.12);
+                color: {Palette.ACCENT_AMBER};
+            }}
+            QLabel#sourceStatus[status="failed"] {{
+                background-color: rgba(248,113,113,0.12);
+                color: {Palette.ACCENT_RED};
             }}
             QFrame#agent_progress {{
                 background-color: {Palette.BG_PANEL};
@@ -2087,9 +2876,12 @@ class ZenEditor(QMainWindow):
                 background-color: rgba(248,113,113,0.28);
             }}
             QSplitter::handle {{
-                background-color: {Palette.BORDER};
-                width: 1px;
-                height: 1px;
+                background-color: transparent;
+                width: 3px;
+                height: 3px;
+            }}
+            QSplitter::handle:hover {{
+                background-color: rgba(167,139,250,0.14);
             }}
             QTreeView {{
                 background-color: {Palette.BG_PANEL}; color: {Palette.TEXT_PRIMARY};

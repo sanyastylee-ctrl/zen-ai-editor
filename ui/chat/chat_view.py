@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
-    QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
+    QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy,
 )
 
 from .styles import Palette, Spacing
@@ -56,8 +56,8 @@ class ChatView(QScrollArea):
         self._inner.setObjectName("chat_inner")
         self.setWidget(self._inner)
 
-        # Внешний layout прижимает контентную колонку по центру с боковыми
-        # подушками — на широком экране чат не растягивается на всю ширину.
+        # Стабильная conversation column: на широком экране сообщения остаются
+        # читаемой колонкой, с user справа и assistant слева внутри неё.
         outer = QHBoxLayout(self._inner)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -65,13 +65,14 @@ class ChatView(QScrollArea):
 
         self._column = QWidget()
         self._column.setObjectName("chat_column")
-        self._column.setMaximumWidth(900)   # max-width контента чата
-        outer.addWidget(self._column, 0)
+        self._column.setMaximumWidth(820)   # max-width контента чата
+        self._column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        outer.addWidget(self._column, 8)
         outer.addStretch(1)
 
         self._layout = QVBoxLayout(self._column)
-        self._layout.setContentsMargins(20, 16, 20, 16)
-        self._layout.setSpacing(Spacing.MESSAGE_GAP)
+        self._layout.setContentsMargins(18, 28, 18, 18)
+        self._layout.setSpacing(12)
         self._layout.addStretch(1)  # подушка снизу, добавляем сообщения перед ней
 
         # карта record-id -> widget. Поскольку record-dict передаётся по ссылке,

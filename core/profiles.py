@@ -115,6 +115,8 @@ class AIProfile:
 
     # --- researcher/search ---
     search_enabled: bool = True
+    search_backend: str = "auto"          # auto | searxng | duckduckgo | unavailable
+    searxng_url: str = ""
     max_search_results: int = 5
     max_pages_to_read: int = 3
     require_sources_for_fresh_info: bool = True
@@ -385,6 +387,8 @@ class ProfileManager:
             max_tokens=2048,
             system_prompt=DEFAULT_RESEARCHER_PROMPT,
             search_enabled=True,
+            search_backend="auto",
+            searxng_url="",
             max_search_results=5,
             max_pages_to_read=3,
             require_sources_for_fresh_info=True,
