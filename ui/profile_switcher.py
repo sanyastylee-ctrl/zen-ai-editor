@@ -11,6 +11,7 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QPushButton
 
 from core.profiles import AIProfile, ProfileKind
+from ui.chat.styles import Palette
 
 
 class ProfileSwitcher(QFrame):
@@ -26,29 +27,29 @@ class ProfileSwitcher(QFrame):
         self._layout.setContentsMargins(2, 2, 2, 2)
         self._layout.setSpacing(0)
 
-        self.setStyleSheet("""
-            QFrame#profile_switcher_frame {
-                background: #2D2D2D;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-            }
-            QPushButton {
+        self.setStyleSheet(f"""
+            QFrame#profile_switcher_frame {{
+                background: {Palette.BG_ASSISTANT};
+                border: 1px solid {Palette.BORDER};
+                border-radius: 8px;
+            }}
+            QPushButton {{
                 background: transparent;
-                color: #888888;
+                color: {Palette.TEXT_SECONDARY};
                 border: none;
                 padding: 6px 14px;
                 font-size: 13px;
-                font-weight: 500;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background: #3A3A3A;
-                color: #D4D4D4;
-            }
-            QPushButton[active="true"] {
-                background: #0E639C;
+                font-weight: 600;
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                background: rgba(167,139,250,0.06);
+                color: {Palette.TEXT_PRIMARY};
+            }}
+            QPushButton[active="true"] {{
+                background: {Palette.ACCENT};
                 color: #FFFFFF;
-            }
+            }}
         """)
 
     def set_profiles(self, profiles: list[AIProfile], active_id: str | None) -> None:
@@ -59,7 +60,12 @@ class ProfileSwitcher(QFrame):
             btn.deleteLater()
         self._buttons.clear()
 
-        for profile in profiles:
+        visible_kinds = {ProfileKind.CODER, ProfileKind.COMPANION, ProfileKind.RESEARCHER}
+        visible_profiles = [p for p in profiles if p.kind in visible_kinds]
+        if active_id not in {p.id for p in visible_profiles}:
+            active_id = visible_profiles[0].id if visible_profiles else None
+
+        for profile in visible_profiles:
             icon = self._kind_icon(profile.kind)
             btn = QPushButton(f"{icon}  {profile.name}")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -100,6 +106,7 @@ class ProfileSwitcher(QFrame):
         return {
             ProfileKind.CODER: "⌨",
             ProfileKind.COMPANION: "♡",
-            ProfileKind.VISION: "👁",
+            ProfileKind.RESEARCHER: "⌕",
+            ProfileKind.VISION: "◉",
             ProfileKind.GENERIC: "○",
         }.get(kind, "○")

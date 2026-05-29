@@ -41,7 +41,7 @@ class RuntimeSafetyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_agent_loop_stops_at_max_steps(self):
+    def test_agent_loop_stops_on_no_progress_cycle(self):
         class FakeModel:
             def __call__(self, *args, **kwargs):
                 return iter([
@@ -61,7 +61,6 @@ class RuntimeSafetyTests(unittest.TestCase):
                 coder_profile(),
                 "inspect",
                 project_root=td,
-                max_agent_steps=2,
                 max_tool_calls=10,
                 max_generation_seconds=30,
             )
@@ -74,7 +73,9 @@ class RuntimeSafetyTests(unittest.TestCase):
                  mock.patch("ai.agent.acceleration_warning", return_value=""):
                 worker.run()
 
-            self.assertIn("лимит итераций", "".join(chunks))
+            rendered = "".join(chunks)
+            self.assertIn("повторяющийся цикл", rendered)
+            self.assertNotIn("лимит итераций", rendered)
 
     def test_agent_completion_stops_on_generation_timeout(self):
         class SlowModel:

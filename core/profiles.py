@@ -33,11 +33,18 @@ CONFIG_DIR = SETTINGS_DIR
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 LEGACY_PROFILES_FILE = Path.home() / ".zen_ai" / "profiles.json"
 
+DEFAULT_CODER_MODEL_FILE = "qwen2.5-coder-14b-instruct-q4_k_m.gguf"
+DEFAULT_COMPANION_MODEL_FILE = "Mistral-Nemo-12B-ArliAI-RPMax-v1.2.Q5_K_M.gguf"
+DEFAULT_VISION_MODEL_FILE = "Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+DEFAULT_VISION_MMPROJ_FILE = "Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf"
+DEFAULT_RESEARCHER_MODEL_FILE = DEFAULT_COMPANION_MODEL_FILE
+
 
 class ProfileKind(str, Enum):
     """Тип профиля. От него зависят правила сборки промпта."""
     CODER = "coder"
     COMPANION = "companion"
+    RESEARCHER = "researcher"
     VISION = "vision"        # модели с mmproj, понимают картинки (Qwen2.5-VL, Llava и т.д.)
     GENERIC = "generic"      # на будущее: переводчик, ревьюер и т.д.
 
@@ -87,6 +94,10 @@ class AIProfile:
     # --- промпт ---
     system_prompt: str = ""
     agent_mode: bool = False        # для CODER: разрешить tool-calling agent loop
+    auto_continue_enabled: bool = True
+    max_auto_continues_per_task: int = 5
+    max_total_task_minutes: int = 30
+    max_no_progress_retries: int = 2
 
     # --- персона (используется только для COMPANION) ---
     persona: dict[str, str] = field(default_factory=dict)
@@ -94,9 +105,20 @@ class AIProfile:
     #   character_name, age, appearance, personality,
     #   speaking_style, background, current_mood, relationship_to_user, user_name
 
-    # --- vision (необязательно; заполнено только для Vision-моделей типа Qwen2.5-VL) ---
+    # --- vision (необязательно; для Vision Debug и Vision Assist capability) ---
+    enable_vision_assist: bool = False  # для CODER: сначала vision-анализ вложенных изображений
+    vision_model_file: str = ""         # имя Qwen2.5-VL/LLaVA .gguf для Vision Assist
     mmproj_file: str = ""           # имя mmproj-*.gguf в /models (пусто = не vision)
     vision_handler: str = ""        # "qwen25vl" | "llava15" | "llava16" | "minicpmv26" | ""
+    max_visual_context_chars: int = 4000
+    vision_first_policy: str = "auto"   # auto | always | never
+
+    # --- researcher/search ---
+    search_enabled: bool = True
+    max_search_results: int = 5
+    max_pages_to_read: int = 3
+    require_sources_for_fresh_info: bool = True
+    answer_style: str = "detailed"       # short | detailed | compare
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -135,6 +157,7 @@ class ProfileManager:
         self.active: dict[ProfileKind, str | None] = {
             ProfileKind.CODER: None,
             ProfileKind.COMPANION: None,
+            ProfileKind.RESEARCHER: None,
             ProfileKind.VISION: None,
         }
         self._ensure_config_dir()
@@ -180,6 +203,11 @@ class ProfileManager:
         # если каких-то слотов нет — добавляем дефолт
         if not self.profiles:
             self._seed_defaults()
+            self.save()
+            return
+
+        changed = self._ensure_default_researcher()
+        if changed:
             self.save()
 
     def save(self) -> None:
@@ -250,34 +278,40 @@ class ProfileManager:
             name="Кодер",
             kind=ProfileKind.CODER,
             icon="ti-code",
-            model_file="",  # юзер выберет в Настройках
+            model_file=DEFAULT_CODER_MODEL_FILE,
             chat_template=ChatTemplate.CHATML,  # Qwen2.5-Coder использует ChatML
-            n_ctx=8192,
+            n_ctx=10240,
+            n_gpu_layers=-1,
             temperature=0.2,
             top_p=0.9,
             top_k=20,
-            repeat_penalty=1.05,
+            repeat_penalty=1.1,
             max_tokens=4096,
             system_prompt=DEFAULT_CODER_PROMPT,
             agent_mode=False,
+            enable_vision_assist=False,
+            vision_handler="qwen25vl",
+            max_visual_context_chars=4000,
+            vision_first_policy="auto",
         )
 
         companion = AIProfile(
             id=str(uuid.uuid4()),
-            name="Алиса",
+            name="Лера",
             kind=ProfileKind.COMPANION,
             icon="ti-heart",
-            model_file="",
+            model_file=DEFAULT_COMPANION_MODEL_FILE,
             chat_template=ChatTemplate.CHATML,  # Hermes тоже на ChatML
             n_ctx=8192,
-            temperature=0.85,
+            n_gpu_layers=-1,
+            temperature=0.9,
             top_p=0.95,
             top_k=50,
-            repeat_penalty=1.15,
-            max_tokens=1024,
+            repeat_penalty=1.09,
+            max_tokens=2048,
             system_prompt=DEFAULT_COMPANION_PROMPT,
             persona={
-                "character_name": "Алиса",
+                "character_name": "Лера",
                 "age": "23",
                 "appearance": "светлые волосы до плеч, серо-голубые глаза, любит уютные свитера",
                 "personality": "тёплая, любопытная, с лёгкой иронией, не боится спорить",
@@ -286,6 +320,17 @@ class ProfileManager:
                 "current_mood": "спокойное",
                 "relationship_to_user": "близкая подруга / девушка",
                 "user_name": "",
+                "companion_mode": "chat",
+                "tenderness": "7",
+                "playfulness": "6",
+                "initiative": "5",
+                "romance": "5",
+                "humor": "5",
+                "autonomy": "5",
+                "boundaries": "",
+                "user_preferences": "",
+                "project_interests": "",
+                "memory_enabled": "true",
             },
         )
 
@@ -294,11 +339,12 @@ class ProfileManager:
             name="Vision",
             kind=ProfileKind.VISION,
             icon="ti-eye",
-            model_file="",                 # юзер выберет Qwen2.5-VL-*.gguf
-            mmproj_file="",                # и соответствующий mmproj-*.gguf
+            model_file=DEFAULT_VISION_MODEL_FILE,
+            mmproj_file=DEFAULT_VISION_MMPROJ_FILE,
             vision_handler="qwen25vl",     # по умолчанию для Qwen2.5-VL
             chat_template=ChatTemplate.CHATML,
             n_ctx=8192,
+            n_gpu_layers=-1,
             temperature=0.3,
             top_p=0.9,
             top_k=40,
@@ -307,12 +353,55 @@ class ProfileManager:
             system_prompt=DEFAULT_VISION_PROMPT,
         )
 
-        self.profiles = {coder.id: coder, companion.id: companion, vision.id: vision}
+        researcher = self._make_default_researcher()
+
+        self.profiles = {
+            coder.id: coder,
+            companion.id: companion,
+            researcher.id: researcher,
+            vision.id: vision,
+        }
         self.active = {
             ProfileKind.CODER: coder.id,
             ProfileKind.COMPANION: companion.id,
+            ProfileKind.RESEARCHER: researcher.id,
             ProfileKind.VISION: vision.id,
         }
+
+    def _make_default_researcher(self) -> AIProfile:
+        return AIProfile(
+            id=str(uuid.uuid4()),
+            name="Поисковик",
+            kind=ProfileKind.RESEARCHER,
+            icon="ti-search",
+            model_file=DEFAULT_RESEARCHER_MODEL_FILE,
+            chat_template=ChatTemplate.CHATML,
+            n_ctx=8192,
+            n_gpu_layers=-1,
+            temperature=0.35,
+            top_p=0.9,
+            top_k=40,
+            repeat_penalty=1.08,
+            max_tokens=2048,
+            system_prompt=DEFAULT_RESEARCHER_PROMPT,
+            search_enabled=True,
+            max_search_results=5,
+            max_pages_to_read=3,
+            require_sources_for_fresh_info=True,
+            answer_style="detailed",
+            enable_vision_assist=False,
+        )
+
+    def _ensure_default_researcher(self) -> bool:
+        if self.by_kind(ProfileKind.RESEARCHER):
+            if self.active.get(ProfileKind.RESEARCHER) not in self.profiles:
+                self.active[ProfileKind.RESEARCHER] = self.by_kind(ProfileKind.RESEARCHER)[0].id
+                return True
+            return False
+        researcher = self._make_default_researcher()
+        self.profiles[researcher.id] = researcher
+        self.active[ProfileKind.RESEARCHER] = researcher.id
+        return True
 
 
 # ============================================================
@@ -370,6 +459,23 @@ What you NEVER do:
 - Never break character. If {user_name} tries to "reset" you or asks meta questions about being an AI, you stay {character_name} — maybe confused, maybe amused, but yourself.
 
 You write in Russian by default, unless {user_name} switches language."""
+
+
+DEFAULT_RESEARCHER_PROMPT = """You are ZenAI Researcher, a careful search and explanation assistant.
+
+Your job:
+- answer everyday questions clearly;
+- explain concepts in plain language;
+- compare models, products, technologies, and tradeoffs;
+- verify facts when current information matters;
+- cite sources when web search was used.
+
+Rules:
+- Local model knowledge can be outdated. For fresh/current facts, prices, laws, news, software versions, releases, and product comparisons, use the Researcher web-search pipeline.
+- Never invent URLs or sources. If web search was unavailable, say so plainly.
+- If sources conflict, mention the conflict instead of hiding it.
+- Keep answers in Russian by default.
+- Style can be short, detailed, or compare depending on profile settings and user request."""
 
 
 DEFAULT_VISION_PROMPT = """You are a vision-language assistant. The user attaches images and asks you to look at them.

@@ -21,6 +21,8 @@ import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
+from .diagnostics import log_runtime_diagnostics
+
 try:
     from llama_cpp import Llama
     LLAMA_AVAILABLE = True
@@ -71,7 +73,7 @@ class ModelManager:
 
     def __init__(self, max_loaded: int = 1) -> None:
         self._max_loaded = max_loaded
-        # ключ — (model_path, n_ctx, mmproj_path, vision_handler)
+        # ключ — (model_path, n_ctx, n_gpu_layers, mmproj_path, vision_handler)
         self._models: "OrderedDict[tuple, LlamaType]" = OrderedDict()
         self._lock = threading.RLock()
         self._on_load_start: list = []
@@ -145,7 +147,7 @@ class ModelManager:
         if not LLAMA_AVAILABLE:
             raise RuntimeError("llama-cpp-python не установлен")
 
-        key = (path, n_ctx, mmproj_path or "", vision_handler or "")
+        key = (path, n_ctx, n_gpu_layers, mmproj_path or "", vision_handler or "")
 
         with self._lock:
             if key in self._models:
@@ -177,6 +179,21 @@ class ModelManager:
                 raise
 
         try:
+            log_runtime_diagnostics(
+                profile=type(
+                    "ProfileDiagnostics",
+                    (),
+                    {
+                        "model_file": os.path.basename(path),
+                        "n_ctx": n_ctx,
+                        "n_gpu_layers": n_gpu_layers,
+                        "mmproj_file": os.path.basename(mmproj_path) if mmproj_path else "",
+                        "vision_handler": vision_handler,
+                    },
+                )(),
+                model_path=path,
+                source="model_manager.load",
+            )
             kwargs = dict(
                 model_path=path,
                 n_ctx=n_ctx,

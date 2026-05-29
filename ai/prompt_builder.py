@@ -18,7 +18,18 @@ from dataclasses import dataclass, field
 
 from core.profiles import AIProfile, ProfileKind, ChatTemplate
 from core.chat_templates import format_prompt, detect_template, render_persona
+from core.companion import build_companion_context, compact_companion_history
 from core.token_budget import TokenBudget
+
+
+COMPANION_LIVE_RESPONSE_CONTRACT = """=== Companion Live Response Contract ===
+- You are Lera, not the user.
+- The latest user block is input to answer, not text to imitate.
+- Never repeat the user's message as your whole reply.
+- Never answer only by wrapping user text in parentheses, quotes, or asterisks.
+- Always add new content: a reaction, feeling, question, idea, or continuation.
+- If the user says "Привет", greet back naturally. If the user says "Тут?", answer that you are here.
+- Do not roleplay as the user and do not continue stale assistant replies unless explicitly asked."""
 
 
 @dataclass
@@ -29,6 +40,7 @@ class BuiltPrompt:
     user: str
     history_used: int
     code_context_trimmed: bool
+    history: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +73,12 @@ def _prepare(
     # 1. system
     if profile.kind == ProfileKind.COMPANION:
         system = render_persona(profile.system_prompt, profile.persona, user_name)
+        companion_context = build_companion_context(profile.persona)
+        if companion_context:
+            system = f"{system}\n\n{companion_context}" if system else companion_context
+        if COMPANION_LIVE_RESPONSE_CONTRACT not in system:
+            system = f"{system}\n\n{COMPANION_LIVE_RESPONSE_CONTRACT}" if system else COMPANION_LIVE_RESPONSE_CONTRACT
+        history = compact_companion_history(history)
     else:
         system = profile.system_prompt
         
@@ -97,35 +115,46 @@ def _prepare(
         if "=== AGENT MODE ===" not in system:
             system += agent_instructions
 
-    # 2. user-блок: кодеру и vision добавляем code_context/RAG/файлы
+    # 2. user-блок и system-расширения
+    #
+    # ВАЖНО: code_context (дерево проекта, открытый файл) и rag_snippets — это
+    # "сессионный контекст". Если их класть в user-сообщение, они попадут в
+    # _historyies и зациклят модель: каждый ход в истории будет начинаться с
+    # одной и той же огромной простыни, и модель будет воспринимать каждый
+    # турн как новую сессию.
+    #
+    # Решение: контекст идёт в SYSTEM (один раз, не в истории), а user видит
+    # ровно то, что юзер написал.
     code_trimmed = False
     if profile.kind == ProfileKind.CODER:
-        parts = []
+        # докидываем контекст к system
+        ctx_parts: list[str] = []
         if code_context.strip():
             trimmed_ctx, code_trimmed = budget.trim_code_context(
                 code_context, system, user_message
             )
             if trimmed_ctx:
-                parts.append(f"### Контекст проекта\n```\n{trimmed_ctx}\n```")
+                ctx_parts.append(f"## Project context\n```\n{trimmed_ctx}\n```")
         if rag_snippets.strip():
-            parts.append(f"### Релевантные фрагменты из проекта\n{rag_snippets}")
-        parts.append(f"### Запрос\n{user_message}")
-        user_content = "\n\n".join(parts)
+            ctx_parts.append(f"## Relevant project snippets\n{rag_snippets}")
+        if ctx_parts:
+            system = system + "\n\n" + "\n\n".join(ctx_parts)
+        # user — чистое сообщение, без обёрток "### Запрос"
+        user_content = user_message
 
     elif profile.kind == ProfileKind.VISION:
-        # для Vision не пихаем RAG/деревья — фокус на картинке и тексте
         if code_context.strip():
             trimmed_ctx, code_trimmed = budget.trim_code_context(
                 code_context, system, user_message
             )
-            user_content = f"{user_message}\n\n### Контекст\n{trimmed_ctx}" if trimmed_ctx else user_message
-        else:
-            user_content = user_message
+            if trimmed_ctx:
+                system = system + f"\n\n## Context\n{trimmed_ctx}"
+        user_content = user_message
 
     else:  # COMPANION / GENERIC
         user_content = user_message
         if code_context.strip() and profile.kind != ProfileKind.COMPANION:
-            user_content += f"\n\n### Context\n{code_context}"
+            system = system + f"\n\n## Context\n{code_context}"
 
     # 3. обрезка истории по бюджету
     if history:
@@ -164,6 +193,7 @@ def build(
         user=user_content,
         history_used=len(history),
         code_context_trimmed=code_trimmed,
+        history=list(history),
     )
 
 

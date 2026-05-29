@@ -88,20 +88,25 @@ class ToolBlockWidget(QFrame):
 
     def update_state(self, tool_name: str, detail: str, output: str, ok) -> None:
         self._name_label.setText(tool_name)
+        # detail (путь/команда) — одна строка, не разворачиваем карточку
         if detail:
-            self._detail_label.setText(detail)
-            self._detail_label.setVisible(True)
+            one_line = detail.strip().splitlines()[0][:80] if detail.strip() else ""
+            self._detail_label.setText(one_line)
+            self._detail_label.setVisible(bool(one_line))
         else:
             self._detail_label.setVisible(False)
         self._output_view.setPlainText(output or "")
-        # если output короткий — показываем сразу, не сворачиваем
-        short = output and (len(output) < 200 and output.count("\n") < 4)
+        # output по умолчанию свёрнут (details collapsed), кроме совсем коротких
+        short = output and (len(output) < 120 and output.count("\n") < 2)
         if short:
             self._output_view.setVisible(True)
             self._toggle_btn.setVisible(False)
             self._collapsed = False
         else:
+            self._output_view.setVisible(False)
+            self._collapsed = True
             self._toggle_btn.setVisible(bool(output))
+            self._toggle_btn.setText("▾ детали")
         self._update_dot(ok)
         self._apply_status_style(ok)
 
@@ -124,19 +129,18 @@ class ToolBlockWidget(QFrame):
         )
 
     def _apply_status_style(self, ok) -> None:
+        # Subtle: лёгкий фон + цветная ЛЕВАЯ граница, без заливки всей панели.
         if ok is True:
-            bg = Palette.BG_TOOL_OK
-            border = Palette.ACCENT_GREEN + "55"
+            accent = Palette.ACCENT_GREEN
         elif ok is False:
-            bg = Palette.BG_TOOL_ERR
-            border = Palette.ACCENT_RED + "55"
+            accent = Palette.ACCENT_RED
         else:
-            bg = Palette.BG_TOOL_RUN
-            border = Palette.BORDER_LIGHT
+            accent = Palette.ACCENT_AMBER
         self.setStyleSheet(f"""
             QFrame#tool_card {{
-                background: {bg};
-                border: 1px solid {border};
-                border-radius: {Spacing.CARD_RADIUS - 2}px;
+                background: {Palette.BG_ASSISTANT};
+                border: 1px solid {Palette.BORDER};
+                border-left: 3px solid {accent};
+                border-radius: {Spacing.CODE_RADIUS}px;
             }}
         """)

@@ -115,9 +115,12 @@ class MessageWidget(QFrame):
     def __init__(self, record: dict, parent=None) -> None:
         super().__init__(parent)
         self._record = record
+        self._rendered_text = str(record.get("text", "") or "")
+        self._rendered_streaming = bool(record.get("streaming", False))
         self._content_widgets: list[QWidget] = []  # для обновления при стриме
 
         self.setObjectName("msg_root")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.setStyleSheet("QFrame#msg_root { background: transparent; }")
 
         outer = QHBoxLayout(self)
@@ -144,7 +147,21 @@ class MessageWidget(QFrame):
         # ===== Карточка =====
         self._card = QFrame()
         self._card.setObjectName("msg_card")
-        self._card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._card.setSizePolicy(
+            QSizePolicy.Policy.Preferred if is_user else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
+        if is_user:
+            self._card.setMinimumWidth(120)
+            self._card.setMaximumWidth(660)
+        elif record.get("role") == "assistant":
+            self._card.setMaximumWidth(860)
+        elif record.get("role") == "tool":
+            # tool-карточка не должна тянуться простынёй на всю ширину
+            self._card.setMaximumWidth(560)
+            self._card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        elif record.get("role") == "system":
+            self._card.setMaximumWidth(560)
         self._apply_card_style()
 
         card_layout = QVBoxLayout(self._card)
@@ -152,29 +169,37 @@ class MessageWidget(QFrame):
             Spacing.CARD_PADDING, Spacing.CARD_PADDING - 4,
             Spacing.CARD_PADDING, Spacing.CARD_PADDING,
         )
-        card_layout.setSpacing(8)
+        card_layout.setSpacing(6)
         self._card_layout = card_layout
 
         # ===== Header (имя + время) =====
         header = QHBoxLayout()
         header.setSpacing(8)
         sender_label = QLabel(record.get("sender", ""))
+        sender_label.setAutoFillBackground(False)
+        sender_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         sender_label.setStyleSheet(
             f"color:{Palette.TEXT_PRIMARY}; font-size:12px; font-weight:600;"
+            f"background:transparent; padding:0; margin:0;"
         )
         header.addWidget(sender_label)
 
         time_str = self._format_time(record.get("time"))
         if time_str:
             time_label = QLabel(time_str)
-            time_label.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px;")
+            time_label.setAutoFillBackground(False)
+            time_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            time_label.setStyleSheet(
+                f"color:{Palette.TEXT_DIM}; font-size:11px;"
+                f"background:transparent; padding:0; margin:0;"
+            )
             header.addWidget(time_label)
         header.addStretch()
         card_layout.addLayout(header)
 
         # ===== Контент =====
         self._content_holder = QVBoxLayout()
-        self._content_holder.setSpacing(8)
+        self._content_holder.setSpacing(4)
         self._content_holder.setContentsMargins(0, 0, 0, 0)
         card_layout.addLayout(self._content_holder)
 
@@ -182,14 +207,18 @@ class MessageWidget(QFrame):
         self._rebuild_content()
 
         # компоновка
+        role = record.get("role")
         if is_user:
+            outer.addWidget(self._card)
             outer.addLayout(avatar_holder)
-            outer.addWidget(self._card, 4)  # карточка
+        elif role in ("tool", "system"):
+            # компактная карточка слева, остальное место — подушка
+            outer.addLayout(avatar_holder)
+            outer.addWidget(self._card, 0)
+            outer.addStretch(1)
         else:
             outer.addLayout(avatar_holder)
             outer.addWidget(self._card, 1)
-            # справа stretch чтобы карточка не растягивалась на весь экран? нет, наоборот пусть растёт
-            # но ограничим левым отступом для tool/system
             outer.addStretch(0)
 
         # лимит ширины
@@ -201,17 +230,21 @@ class MessageWidget(QFrame):
 
     def update_record(self, record: dict) -> None:
         """Обновляет содержимое (для стрима или финального состояния tool)."""
-        prev_text = self._record.get("text", "")
         prev_role = self._record.get("role")
         self._record = record
 
         if prev_role == "tool" or record.get("role") == "tool":
             self._rebuild_content()
+            self._rendered_text = str(record.get("text", "") or "")
+            self._rendered_streaming = bool(record.get("streaming", False))
             return
 
-        # для assistant/user — пересобираем только если текст изменился
-        if record.get("text", "") != prev_text or record.get("streaming"):
+        current_text = str(record.get("text", "") or "")
+        current_streaming = bool(record.get("streaming", False))
+        if current_text != self._rendered_text or current_streaming != self._rendered_streaming:
             self._rebuild_content()
+            self._rendered_text = current_text
+            self._rendered_streaming = current_streaming
 
     # ============================================================
     # внутренности
@@ -269,6 +302,7 @@ class MessageWidget(QFrame):
         text = self._record.get("text", "") or ""
         streaming = self._record.get("streaming", False)
         blocks = parse(text)
+        blocks = self._merge_adjacent_text_blocks(blocks)
         if not blocks and streaming:
             # пока пусто, но стрим начался — показываем мигающий курсор
             spinner = QLabel("▍")
@@ -304,9 +338,11 @@ class MessageWidget(QFrame):
             label = QLabel(html)
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.RichText)
+            label.setAutoFillBackground(False)
+            label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             label.setStyleSheet(
                 f"color:{Palette.TEXT_PRIMARY}; font-size:{size}px;"
-                f"font-weight:700; padding-top:4px;"
+                f"font-weight:700; padding:0px; background:transparent;"
             )
             return label
 
@@ -333,20 +369,24 @@ class MessageWidget(QFrame):
         if btype == "list":
             items = blk.get("items", [])
             ordered = blk.get("ordered", False)
-            lines = []
-            for i, it in enumerate(items, 1):
-                bullet = f"{i}." if ordered else "•"
+            tag = "ol" if ordered else "ul"
+            lines = [f"<{tag} style='margin:2px 0 2px 18px; padding-left:18px;'>"]
+            for it in items:
                 content_html = inline_to_html(it, Palette)
                 lines.append(
-                    f"<div style='padding:2px 0;'>"
-                    f"<span style='color:{Palette.TEXT_DIM}; "
-                    f"display:inline-block; min-width:24px;'>{bullet}</span>"
-                    f"<span style='color:{Palette.TEXT_PRIMARY};'>{content_html}</span>"
-                    f"</div>"
+                    f"<li style='margin:3px 0; line-height:145%; color:{Palette.TEXT_PRIMARY};'>"
+                    f"{content_html}</li>"
                 )
+            lines.append(f"</{tag}>")
             label = QLabel("".join(lines))
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.RichText)
+            label.setAutoFillBackground(False)
+            label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            label.setStyleSheet(
+                f"color:{Palette.TEXT_PRIMARY}; font-size:14px; line-height:1.65;"
+                f"background:transparent; padding:0; margin:0;"
+            )
             return label
 
         # text
@@ -354,7 +394,9 @@ class MessageWidget(QFrame):
         if streaming and is_last:
             text_content = text_content + " ▍"
         html = inline_to_html(text_content, Palette)
-        label = QLabel(html)
+        label = QLabel(
+            f"<div style='line-height:145%; background:transparent;'>{html}</div>"
+        )
         label.setWordWrap(True)
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setTextInteractionFlags(
@@ -362,11 +404,34 @@ class MessageWidget(QFrame):
             | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
         label.setOpenExternalLinks(True)
+        label.setAutoFillBackground(False)
+        label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         label.setStyleSheet(
-            f"color:{Palette.TEXT_PRIMARY}; font-size:13px;"
-            f"line-height:1.5;"
+            f"color:{Palette.TEXT_PRIMARY}; font-size:14px; line-height:1.65;"
+            f"background:transparent; padding:0; margin:0;"
         )
         return label
+
+    @staticmethod
+    def _merge_adjacent_text_blocks(blocks: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        pending: dict | None = None
+        for blk in blocks:
+            if blk.get("type") == "text":
+                content = blk.get("content", "")
+                if pending is None:
+                    pending = dict(blk)
+                    pending["content"] = content
+                else:
+                    pending["content"] = f"{pending.get('content', '')}\n\n{content}"
+                continue
+            if pending is not None:
+                merged.append(pending)
+                pending = None
+            merged.append(blk)
+        if pending is not None:
+            merged.append(pending)
+        return merged
 
     @staticmethod
     def _format_time(iso: str | None) -> str:

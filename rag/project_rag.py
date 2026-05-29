@@ -1,6 +1,6 @@
 """
 Project RAG: индексация исходников проекта и семантический поиск релевантных
-фрагментов. faiss + sentence-transformers. Кэш на диске в .zen_ai/.
+фрагментов. faiss + sentence-transformers. Кэш на диске в AppData/ZenAI/memory/.
 
 Логика из исходного zen_editor.py, без изменений по сути.
 """
@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from core.app_data import migrate_legacy_file, project_memory_dir
 
 try:
     import faiss
@@ -35,8 +37,10 @@ class ProjectRAG:
     # ---------- storage ----------
 
     def _storage_dir(self) -> Path:
-        d = Path(os.getcwd()) / ".zen_ai"
-        d.mkdir(parents=True, exist_ok=True)
+        d = project_memory_dir(os.getcwd())
+        legacy = Path(os.getcwd()) / ".zen_ai"
+        for filename in ("project.faiss", "meta.json", "chunks.json"):
+            migrate_legacy_file(legacy / filename, d / filename)
         return d
 
     def _ensure_model(self) -> None:
@@ -66,11 +70,14 @@ class ProjectRAG:
         if not RAG_AVAILABLE or self._index is None:
             return
         d = self._storage_dir()
-        faiss.write_index(self._index, str(d / "project.faiss"))
-        with open(d / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(self._chunk_meta, f)
-        with open(d / "chunks.json", "w", encoding="utf-8") as f:
-            json.dump(self._chunks, f)
+        try:
+            faiss.write_index(self._index, str(d / "project.faiss"))
+            with open(d / "meta.json", "w", encoding="utf-8") as f:
+                json.dump(self._chunk_meta, f)
+            with open(d / "chunks.json", "w", encoding="utf-8") as f:
+                json.dump(self._chunks, f)
+        except OSError:
+            pass
 
     # ---------- индексация ----------
 

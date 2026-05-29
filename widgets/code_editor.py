@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit,
 )
 
+from ui.chat.styles import Palette, mono_font, form_controls_qss
+
 try:
     from PyQt6.Qsci import (
         QsciScintilla, QsciLexerPython, QsciLexerCPP, QsciLexerJavaScript,
@@ -33,30 +35,72 @@ except ImportError:
 
 def make_scintilla_editor() -> "QsciScintilla":
     editor = QsciScintilla()
-    editor.setFont(QFont("Consolas", 11))
-    editor.setMarginsFont(QFont("Consolas", 9))
-    editor.setMarginWidth(0, "0000")
+    code_font = mono_font(11)
+    margin_font = mono_font(9)
+    editor.setFont(code_font)
+    editor.setMarginsFont(margin_font)
+
+    # Margin 0 — номера строк
+    editor.setMarginWidth(0, "0000 ")
     editor.setMarginLineNumbers(0, True)
-    editor.setMarginsBackgroundColor(QColor("#252526"))
-    editor.setMarginsForegroundColor(QColor("#858585"))
-    editor.setFolding(QsciScintilla.FoldStyle.BoxedTreeFoldStyle, 2)
-    editor.setFoldMarginColors(QColor("#252526"), QColor("#252526"))
+    # Margin 1 — символы (не используем, убираем полностью)
+    editor.setMarginWidth(1, 0)
+    # Margin 2 — fold (сворачивание)
+    editor.setMarginWidth(2, 12)
+    editor.setFolding(QsciScintilla.FoldStyle.PlainFoldStyle, 2)
+
+    # Все margins ОДНОГО цвета с фоном кода — никакого белого столба
+    bg = QColor(Palette.BG_CODE)
+    editor.setMarginsBackgroundColor(bg)
+    editor.setMarginsForegroundColor(QColor(Palette.TEXT_DIM))
+    editor.setFoldMarginColors(bg, bg)
+
+    # Убираем белые полосы от маркеров отладчика (margins 3-4)
+    editor.setMarginWidth(3, 0)
+    editor.setMarginWidth(4, 0)
+
     editor.setCaretLineVisible(True)
-    editor.setCaretLineBackgroundColor(QColor("#2A2D2E"))
-    editor.setCaretForegroundColor(QColor("#AEAFAD"))
-    editor.setPaper(QColor("#1E1E1E"))
-    editor.setColor(QColor("#D4D4D4"))
+    editor.setCaretLineBackgroundColor(QColor(167, 139, 250, 15))
+    editor.setCaretForegroundColor(QColor(Palette.ACCENT))
+    editor.setPaper(bg)
+    editor.setColor(QColor(Palette.TEXT_PRIMARY))
+    editor.setSelectionBackgroundColor(QColor(167, 139, 250, 60))
+    editor.setSelectionForegroundColor(QColor(Palette.TEXT_PRIMARY))
     editor.setIndentationsUseTabs(False)
     editor.setTabWidth(4)
     editor.setAutoIndent(True)
     editor.setIndentationGuides(True)
+    editor.setIndentationGuidesBackgroundColor(bg)
+    editor.setIndentationGuidesForegroundColor(QColor(Palette.BORDER))
     editor.setBraceMatching(QsciScintilla.BraceMatch.SloppyBraceMatch)
-    editor.setMatchedBraceBackgroundColor(QColor("#3B514D"))
-    editor.setMatchedBraceForegroundColor(QColor("#4DC9B0"))
+    editor.setMatchedBraceBackgroundColor(QColor(167, 139, 250, 45))
+    editor.setMatchedBraceForegroundColor(QColor(Palette.ACCENT_HOVER))
     editor.setWrapMode(QsciScintilla.WrapMode.WrapNone)
     editor.setAutoCompletionSource(QsciScintilla.AutoCompletionSource.AcsAll)
     editor.setAutoCompletionThreshold(2)
     editor.setAutoCompletionCaseSensitivity(False)
+    editor.setStyleSheet(f"""
+        QsciScintilla {{
+            background: {Palette.BG_CODE};
+            color: {Palette.TEXT_PRIMARY};
+            border: none;
+        }}
+        QScrollBar:vertical, QScrollBar:horizontal {{
+            background: transparent; border: none;
+        }}
+        QScrollBar:vertical {{ width: 10px; }}
+        QScrollBar:horizontal {{ height: 10px; }}
+        QScrollBar::handle {{
+            background: rgba(167,139,250,0.35);
+            border-radius: 5px;
+            min-height: 28px; min-width: 28px;
+        }}
+        QScrollBar::handle:hover {{ background: rgba(184,163,255,0.55); }}
+        QScrollBar::add-line, QScrollBar::sub-line,
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: transparent; border: none; width: 0; height: 0;
+        }}
+    """)
     return editor
 
 
@@ -73,14 +117,127 @@ def set_lexer_for_file(editor, file_path: str) -> None:
         ".json": QsciLexerJSON,
     }
     cls = lexer_map.get(ext)
-    if cls:
-        lexer = cls(editor)
-        lexer.setFont(QFont("Consolas", 11))
-        lexer.setDefaultPaper(QColor("#1E1E1E"))
-        lexer.setDefaultColor(QColor("#D4D4D4"))
-        editor.setLexer(lexer)
-    else:
+    if not cls:
         editor.setLexer(None)
+        return
+
+    lexer = cls(editor)
+    lexer.setFont(mono_font(11))
+    bg = QColor(Palette.BG_CODE)
+    lexer.setDefaultPaper(bg)
+    lexer.setDefaultColor(QColor(Palette.TEXT_PRIMARY))
+
+    # Все стили получают тёмный фон — иначе некоторые токены остаются белыми
+    for i in range(128):
+        try:
+            lexer.setPaper(bg, i)
+            lexer.setFont(mono_font(11), i)
+        except Exception:
+            pass
+
+    editor.setLexer(lexer)
+
+    # Раскраска по типам токенов
+    _apply_colors(lexer, cls)
+
+
+def _c(hex_color: str) -> QColor:
+    return QColor(hex_color)
+
+
+def _apply_colors(lexer, cls) -> None:
+    """Красит токены лексера в нашу палитру."""
+
+    KW   = Palette.ACCENT           # ключевые слова    — лавандовый
+    STR  = "#A5D6A7"                 # строки            — зелёный
+    NUM  = "#F78C6C"                 # числа             — оранжевый
+    CMT  = Palette.TEXT_DIM          # комментарии       — серый
+    FN   = "#82AAFF"                 # функции/методы    — голубой
+    CLS  = "#4EC9B0"                 # классы/типы       — циан
+    DEC  = Palette.ACCENT_AMBER      # декораторы        — янтарный
+    OP   = Palette.TEXT_SECONDARY    # операторы         — светло-серый
+    TXT  = Palette.TEXT_PRIMARY      # обычный текст
+
+    def c(style, color):
+        try:
+            lexer.setColor(_c(color), style)
+        except Exception:
+            pass
+
+    if cls is QsciLexerPython:
+        c(QsciLexerPython.Default,             TXT)
+        c(QsciLexerPython.Comment,             CMT)
+        c(QsciLexerPython.CommentBlock,        CMT)
+        c(QsciLexerPython.Number,              NUM)
+        c(QsciLexerPython.DoubleQuotedString,  STR)
+        c(QsciLexerPython.SingleQuotedString,  STR)
+        c(QsciLexerPython.TripleDoubleQuotedString, STR)
+        c(QsciLexerPython.TripleSingleQuotedString, STR)
+        c(QsciLexerPython.Keyword,             KW)
+        c(QsciLexerPython.FunctionMethodName,  FN)
+        c(QsciLexerPython.ClassName,           CLS)
+        c(QsciLexerPython.Operator,            OP)
+        c(QsciLexerPython.Identifier,          TXT)
+        c(QsciLexerPython.Decorator,           DEC)
+
+    elif cls is QsciLexerJavaScript:
+        c(QsciLexerJavaScript.Default,         TXT)
+        c(QsciLexerJavaScript.Comment,         CMT)
+        c(QsciLexerJavaScript.CommentLine,     CMT)
+        c(QsciLexerJavaScript.CommentDoc,      CMT)
+        c(QsciLexerJavaScript.Number,          NUM)
+        c(QsciLexerJavaScript.Keyword,         KW)
+        c(QsciLexerJavaScript.DoubleQuotedString, STR)
+        c(QsciLexerJavaScript.SingleQuotedString, STR)
+        c(QsciLexerJavaScript.Operator,        OP)
+        c(QsciLexerJavaScript.Identifier,      TXT)
+        c(QsciLexerJavaScript.Regex,           STR)
+
+    elif cls is QsciLexerCPP:
+        c(QsciLexerCPP.Default,                TXT)
+        c(QsciLexerCPP.Comment,                CMT)
+        c(QsciLexerCPP.CommentLine,            CMT)
+        c(QsciLexerCPP.CommentDoc,             CMT)
+        c(QsciLexerCPP.Number,                 NUM)
+        c(QsciLexerCPP.Keyword,                KW)
+        c(QsciLexerCPP.DoubleQuotedString,     STR)
+        c(QsciLexerCPP.SingleQuotedString,     STR)
+        c(QsciLexerCPP.Operator,               OP)
+        c(QsciLexerCPP.Identifier,             TXT)
+        c(QsciLexerCPP.PreProcessor,           DEC)
+        c(QsciLexerCPP.UUID,                   STR)
+
+    elif cls is QsciLexerJSON:
+        c(QsciLexerJSON.Default,               TXT)
+        c(QsciLexerJSON.String,                STR)
+        c(QsciLexerJSON.Number,                NUM)
+        c(QsciLexerJSON.Keyword,               KW)
+        c(QsciLexerJSON.Operator,              OP)
+        c(QsciLexerJSON.Error,                 Palette.ACCENT_RED)
+        try:
+            c(QsciLexerJSON.Property,          FN)
+        except Exception:
+            pass
+
+    elif cls is QsciLexerCSS:
+        c(QsciLexerCSS.Default,                TXT)
+        c(QsciLexerCSS.Comment,                CMT)
+        c(QsciLexerCSS.Tag,                    KW)
+        c(QsciLexerCSS.ClassSelector,          CLS)
+        c(QsciLexerCSS.IDSelector,             DEC)
+        c(QsciLexerCSS.Attribute,              FN)
+        c(QsciLexerCSS.Value,                  STR)
+        c(QsciLexerCSS.Operator,               OP)
+        c(QsciLexerCSS.PseudoClass,            KW)
+
+    elif cls is QsciLexerHTML:
+        c(QsciLexerHTML.Default,               TXT)
+        c(QsciLexerHTML.Tag,                   KW)
+        c(QsciLexerHTML.Attribute,             FN)
+        c(QsciLexerHTML.HTMLDoubleQuotedString, STR)
+        c(QsciLexerHTML.HTMLSingleQuotedString, STR)
+        c(QsciLexerHTML.HTMLComment,           CMT)
+        c(QsciLexerHTML.Entity,                DEC)
 
 
 # ============================================================
@@ -138,28 +295,26 @@ class DiffApplyDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Diff — предпросмотр изменений")
         self.resize(900, 600)
-        self.setStyleSheet("""
-            QDialog { background-color: #1E1E1E; color: #D4D4D4; }
-            QTextEdit { background-color: #0D1117; color: #E6EDF3;
-                        border: none; font-family: Consolas; font-size: 12px; }
-            QPushButton {
-                background-color: #238636; color: white;
-                border-radius: 4px; padding: 6px 18px;
-                font-weight: bold; border: none;
-            }
-            QPushButton:hover { background-color: #2EA043; }
-            QPushButton#reject {
-                background-color: #3C3C3C; color: #D4D4D4;
-                border: 1px solid #555555;
-            }
-            QPushButton#reject:hover { background-color: #4A4A4A; }
+        self.setStyleSheet(form_controls_qss() + f"""
+            QDialog {{ background-color: {Palette.BG_APP}; color: {Palette.TEXT_PRIMARY}; }}
+            QTextEdit {{ background-color: {Palette.BG_CODE}; color: {Palette.TEXT_PRIMARY};
+                        border: 1px solid {Palette.BORDER}; font-family: "{mono_font(12).family()}"; font-size: 12px; }}
+            QPushButton {{
+                background-color: {Palette.ACCENT}; color: white;
+            }}
+            QPushButton:hover {{ background-color: {Palette.ACCENT_HOVER}; }}
+            QPushButton#reject {{
+                background-color: transparent; color: {Palette.TEXT_SECONDARY};
+                border: 1px solid {Palette.BORDER};
+            }}
+            QPushButton#reject:hover {{ background-color: rgba(167,139,250,0.06); }}
         """)
 
         self.accepted_code = new_code
 
         layout = QVBoxLayout(self)
         label = QLabel("Зелёный — добавлено, красный — удалено. Принять?")
-        label.setStyleSheet("color:#888; font-size:12px; padding:4px;")
+        label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px; padding:4px;")
         layout.addWidget(label)
 
         self.diff_view = QTextEdit()

@@ -16,32 +16,62 @@ class RunTerminalTool(Tool):
         "python", "py", "pytest", "pip",
         "node", "npm", "npx", "yarn", "pnpm",
         "git",
+        "powershell", "powershell.exe", "pwsh", "pwsh.exe",
     }
     BLOCKED_TOKENS = {
         "rm", "del", "erase", "rmdir", "remove-item", "rd",
         "format", "shutdown", "restart-computer",
     }
     CONTROL_CHARS = {"|", "&", ";", ">", "<"}
+    INSTALL_COMMANDS = {
+        ("pip", "install"),
+        ("python", "-m", "pip", "install"),
+        ("py", "-m", "pip", "install"),
+        ("npm", "install"),
+        ("npm", "i"),
+        ("yarn", "add"),
+        ("pnpm", "add"),
+        ("npx",),
+    }
+    GIT_NEEDS_CONFIRMATION = {"reset", "clean", "checkout", "switch", "restore", "rebase"}
+
+    def classify_command(self, command: str) -> tuple[str, str]:
+        command = command.strip()
+        if not command:
+            return "blocked", "missing command"
+        if any(ch in command for ch in self.CONTROL_CHARS):
+            return "blocked", "shell control operators are blocked"
+        try:
+            args = shlex.split(command, posix=os.name != "nt")
+        except ValueError as e:
+            return "blocked", str(e)
+        if not args:
+            return "blocked", "empty command"
+
+        lowered_args = [arg.lower() for arg in args]
+        exe = lowered_args[0]
+        if exe not in self.ALLOWED:
+            return "blocked", f"command not whitelisted: {args[0]}"
+        if set(lowered_args) & self.BLOCKED_TOKENS:
+            return "blocked", "destructive command token is blocked"
+        if exe in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+            return "needs_confirmation", "PowerShell commands require confirmation"
+        if exe == "git" and len(lowered_args) > 1 and lowered_args[1] in self.GIT_NEEDS_CONFIRMATION:
+            return "needs_confirmation", f"git {lowered_args[1]} requires confirmation"
+        for prefix in self.INSTALL_COMMANDS:
+            if tuple(lowered_args[:len(prefix)]) == prefix:
+                return "needs_confirmation", "install commands require confirmation"
+        return "safe", "safe command"
 
     def execute(self, call: ToolCall) -> ToolResult:
         command = call.args.get("command", "").strip()
-        if not command:
-            return ToolResult.error("missing command")
-        if any(ch in command for ch in self.CONTROL_CHARS):
-            return ToolResult.error("shell control operators are blocked")
+        safety, reason = self.classify_command(command)
+        if safety == "blocked":
+            return ToolResult.error(reason)
         try:
             args = shlex.split(command, posix=os.name != "nt")
         except ValueError as e:
             return ToolResult.error(str(e))
-        if not args:
-            return ToolResult.error("empty command")
-
-        exe = args[0].lower()
-        if exe not in self.ALLOWED:
-            return ToolResult.error(f"command not whitelisted: {args[0]}")
-        lowered = {a.lower() for a in args}
-        if lowered & self.BLOCKED_TOKENS:
-            return ToolResult.error("destructive command token is blocked", critical=True)
 
         try:
             proc = subprocess.run(

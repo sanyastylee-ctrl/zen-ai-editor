@@ -20,14 +20,20 @@ Worker для асинхронной генерации.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
+import time
+import uuid
+from dataclasses import replace
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.diagnostics import acceleration_warning, write_log
 from core.model_manager import ModelManager, LLAMA_AVAILABLE
 from core.profiles import AIProfile, ProfileKind
 from core.paths import resolve_model_path
+from core.companion import companion_echo_similarity, is_companion_echo_response, normalize_companion_reply_for_repeat
 from . import prompt_builder
 
 
@@ -38,6 +44,7 @@ _LOOP_PATTERN = re.compile(r"(.{20,}?)\1{2,}", re.DOTALL)
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+MAX_GENERATION_SECONDS = 180
 
 
 class InferenceWorker(QThread):
@@ -56,6 +63,8 @@ class InferenceWorker(QThread):
         history: list[tuple[str, str]] | None = None,
         user_name: str = "",
         attached_files: list[str] | None = None,
+        max_generation_seconds: int = MAX_GENERATION_SECONDS,
+        allow_agent_actions: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -66,7 +75,13 @@ class InferenceWorker(QThread):
         self.history = history or []
         self.user_name = user_name
         self.attached_files = attached_files or []
+        self.max_generation_seconds = max(1, int(max_generation_seconds or MAX_GENERATION_SECONDS))
+        self.allow_agent_actions = allow_agent_actions
         self._stop = False
+        self.run_id = uuid.uuid4().hex[:12]
+        self.companion_response_valid = True
+        self.companion_block_reason = ""
+        self.validated_response_text = ""
 
         # callbacks для отписки от ModelManager в finally
         self._cb_start = None
@@ -116,6 +131,12 @@ class InferenceWorker(QThread):
                 vision_handler = self.profile.vision_handler
 
             # 2) Грузим модель (или достаём из кэша)
+            if self.profile.kind == ProfileKind.CODER:
+                warning = acceleration_warning(self.profile, model_path)
+                if warning:
+                    self.status.emit("⚠ CPU backend")
+                    self.chunk_received.emit(f"\n[Предупреждение: {warning}]\n")
+
             model = mm.get_model(
                 path=model_path,
                 n_ctx=self.profile.n_ctx,
@@ -165,6 +186,10 @@ class InferenceWorker(QThread):
     # ============================================================
 
     def _run_completion_mode(self, model, stop_seq: list[str]) -> None:
+        if self.profile.kind == ProfileKind.COMPANION:
+            self._run_companion_completion_mode(model, stop_seq)
+            return
+
         built = prompt_builder.build(
             profile=self.profile,
             user_message=self.user_message,
@@ -189,9 +214,14 @@ class InferenceWorker(QThread):
         )
 
         generated = ""
+        started = time.monotonic()
         for chunk in stream:
             if self._stop:
                 self.chunk_received.emit("\n[остановлено]")
+                break
+            if time.monotonic() - started > self.max_generation_seconds:
+                self._stop = True
+                self.chunk_received.emit("\n[остановлено: превышен лимит времени генерации]\n")
                 break
             text = chunk["choices"][0]["text"]
             if text:
@@ -205,6 +235,302 @@ class InferenceWorker(QThread):
         
         # Выполняем действия агента, когда текст сгенерирован полностью
         self._execute_agent_actions(generated)
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    @staticmethod
+    def _normalize_response(text: str) -> str:
+        return normalize_companion_reply_for_repeat(text)
+
+    def _is_companion_repeat(self, response: str, prior_responses: list[str]) -> tuple[bool, str, float]:
+        if "[previous repetitive companion reply omitted]" in str(response or ""):
+            return True, "history_compaction_marker_leaked", 1.0
+        response_norm = self._normalize_response(response)
+        if not response_norm:
+            return False, "", 0.0
+        best_similarity = 0.0
+        for index, prior in enumerate(prior_responses):
+            prior_norm = self._normalize_response(prior)
+            if not prior_norm:
+                continue
+            similarity = 1.0 if response_norm == prior_norm else companion_echo_similarity(prior_norm, response_norm)
+            best_similarity = max(best_similarity, similarity)
+            if response_norm == prior_norm:
+                return True, f"assistant_repeat_{index}", similarity
+            if similarity >= 0.94 and len(response_norm) >= 24:
+                return True, f"assistant_near_repeat_{index}", similarity
+        return False, "", best_similarity
+
+    def _log_companion(self, event: str, **fields) -> None:
+        parts = [f"[companion_{event}]"]
+        for key in sorted(fields):
+            value = str(fields[key]).replace("\\", "\\\\").replace('"', "'").replace("\n", "\\n")
+            parts.append(f'{key}="{value}"')
+        write_log(" ".join(parts))
+
+    def _run_companion_completion_mode(self, model, stop_seq: list[str]) -> None:
+        prior_responses = [str(assistant or "") for _user, assistant in (self.history[-5:] if self.history else [])]
+        previous_response = prior_responses[-1] if prior_responses else ""
+        previous_hash = self._hash_text(previous_response)
+        latest_hash = self._hash_text(self.user_message)
+        total_messages = len(self.history) * 2 + 1
+        self._log_companion(
+            "send_start",
+            run_id=self.run_id,
+            session_id=self.profile.id,
+            turn_id=len(self.history) + 1,
+            text_hash=latest_hash,
+            text_len=len(self.user_message or ""),
+        )
+
+        retry_note = (
+            "\n\nImportant live-turn rule: answer the latest user message, not your previous reply. "
+            "Do not repeat your last response; mention the latest marker/message if present. "
+            "Do not echo, quote, or parenthesize the user's message as your whole reply. "
+            "Reply as Lera with new meaningful content."
+        )
+        attempts: list[tuple[list[tuple[str, str]], AIProfile]] = [
+            (self.history, self.profile),
+            ([], replace(self.profile, system_prompt=(self.profile.system_prompt or "") + retry_note)),
+        ]
+
+        for attempt, (history, profile) in enumerate(attempts):
+            built = prompt_builder.build(
+                profile=profile,
+                user_message=self.user_message,
+                code_context=self.code_context,
+                rag_snippets=self.rag_snippets,
+                history=history,
+                user_name=self.user_name,
+            )
+            included_messages = built.history_used * 2 + 1
+            last_roles = "user,assistant" if built.history_used else ""
+            if built.history:
+                last_roles = ",".join(["user", "assistant"] * min(2, len(built.history)))
+            contains_latest = bool(self.user_message and self.user_message in built.formatted)
+            if len(history) != built.history_used:
+                self._log_companion(
+                    "context_trim",
+                    run_id=self.run_id,
+                    before=len(history),
+                    after=built.history_used,
+                    kept_last_user=contains_latest,
+                )
+            self._log_companion(
+                "history_build",
+                run_id=self.run_id,
+                total_messages=total_messages,
+                included_messages=included_messages,
+                last_roles=last_roles,
+                last_user_hash=latest_hash,
+            )
+            self._log_companion(
+                "memory_used",
+                run_id=self.run_id,
+                memory_items_count=built.system.count("- ["),
+                summary_chars=len(built.system),
+            )
+            prompt_hash = self._hash_text(built.formatted)
+            self._log_companion(
+                "prompt_ready",
+                run_id=self.run_id,
+                prompt_hash=prompt_hash,
+                prompt_chars=len(built.formatted),
+                contains_latest_user=contains_latest,
+                latest_user_hash=latest_hash,
+                last_roles=last_roles,
+            )
+            if not contains_latest:
+                msg = "\n[Ошибка Леры: последний user message не попал в prompt; генерация остановлена]\n"
+                self.companion_response_valid = False
+                self.companion_block_reason = "latest_user_missing"
+                self.validated_response_text = ""
+                self._log_companion(
+                    "prompt_abort",
+                    run_id=self.run_id,
+                    reason="latest_user_missing",
+                    prompt_hash=prompt_hash,
+                )
+                self.chunk_received.emit(msg)
+                return
+
+            self._log_companion("worker_start", run_id=self.run_id, prompt_hash=prompt_hash)
+            generated, emitted_to_ui, pending_text = self._generate_completion_buffer(
+                model,
+                built.formatted,
+                stop_seq,
+                stream_to_ui=False,
+            )
+            response_hash = self._hash_text(generated)
+            self._log_companion(
+                "response_raw",
+                run_id=self.run_id,
+                response_hash=response_hash,
+                response_len=len(generated),
+            )
+            if not generated.strip():
+                action = "retry" if attempt == 0 else "error"
+                self._log_companion(
+                    "response_blocked" if attempt else "retry",
+                    run_id=self.run_id,
+                    reason="empty_response",
+                    action=action,
+                    response_hash=response_hash,
+                )
+                if attempt == 0:
+                    continue
+                error = "\n[Лера сгенерировала пустой ответ. Ответ не сохранён.]\n"
+                self.companion_response_valid = False
+                self.companion_block_reason = "empty_response"
+                self.validated_response_text = ""
+                self.chunk_received.emit(error)
+                self._log_companion("state_cleanup", run_id=self.run_id)
+                return
+            is_echo, echo_similarity = is_companion_echo_response(self.user_message, generated)
+            if is_echo:
+                action = "retry" if attempt == 0 else "error"
+                self._log_companion(
+                    "echo_detected",
+                    run_id=self.run_id,
+                    user_hash=latest_hash,
+                    response_hash=response_hash,
+                    similarity=f"{echo_similarity:.3f}",
+                    action=action,
+                )
+                if attempt == 0:
+                    self._log_companion("retry", run_id=self.run_id, reason="echo")
+                    continue
+                error = "\n[Лера сгенерировала повтор/эхо. Ответ не сохранён.]\n"
+                self.companion_response_valid = False
+                self.companion_block_reason = "echo"
+                self.validated_response_text = ""
+                self.chunk_received.emit(error)
+                self._log_companion(
+                    "response_blocked",
+                    run_id=self.run_id,
+                    reason="echo",
+                    response_hash=response_hash,
+                )
+                self._log_companion("state_cleanup", run_id=self.run_id)
+                return
+
+            is_repeat, repeat_reason, repeat_similarity = self._is_companion_repeat(generated, prior_responses)
+            if is_repeat:
+                action = "retry" if attempt == 0 else "error"
+                self._log_companion(
+                    "repeat_detected",
+                    run_id=self.run_id,
+                    previous_response_hash=previous_hash,
+                    new_response_hash=response_hash,
+                    reason=repeat_reason,
+                    similarity=f"{repeat_similarity:.3f}",
+                    action=action,
+                )
+                if attempt == 0:
+                    self._log_companion("retry", run_id=self.run_id, reason="repeat")
+                    continue
+                error = (
+                    "\n[Лера остановлена: модель повторила предыдущий ответ вместо ответа "
+                    "на новое сообщение. Попробуй переформулировать коротко.]\n"
+                )
+                self.companion_response_valid = False
+                self.companion_block_reason = "repeat"
+                self.validated_response_text = ""
+                self.chunk_received.emit(error)
+                self._log_companion(
+                    "response_blocked",
+                    run_id=self.run_id,
+                    reason="repeat",
+                    response_hash=response_hash,
+                )
+                self._log_companion(
+                    "response_finish",
+                    run_id=self.run_id,
+                    response_hash=self._hash_text(error),
+                    response_len=len(error),
+                )
+                self._log_companion("state_cleanup", run_id=self.run_id)
+                return
+
+            if pending_text:
+                self.validated_response_text = generated
+                self.chunk_received.emit(pending_text)
+            else:
+                self.validated_response_text = generated
+            self._log_companion(
+                "response_finish",
+                run_id=self.run_id,
+                response_hash=response_hash,
+                response_len=len(generated),
+            )
+            self._log_companion("response_saved", run_id=self.run_id, response_hash=response_hash)
+            self._log_companion("state_cleanup", run_id=self.run_id)
+            return
+
+    def _generate_completion_buffer(
+        self,
+        model,
+        formatted_prompt: str,
+        stop_seq: list[str],
+        stream_to_ui: bool = False,
+    ) -> tuple[str, bool, str]:
+        stream = model(
+            formatted_prompt,
+            max_tokens=self.profile.max_tokens,
+            temperature=self.profile.temperature,
+            top_p=self.profile.top_p,
+            top_k=self.profile.top_k,
+            repeat_penalty=self.profile.repeat_penalty,
+            stop=stop_seq,
+            stream=True,
+        )
+        generated = ""
+        pending = ""
+        emitted = False
+        started = time.monotonic()
+        self._log_companion("stream_start", run_id=self.run_id)
+        for chunk in stream:
+            if self._stop:
+                pending += "\n[остановлено]"
+                generated += "\n[остановлено]"
+                break
+            if time.monotonic() - started > self.max_generation_seconds:
+                self._stop = True
+                pending += "\n[остановлено: превышен лимит времени генерации]\n"
+                generated += "\n[остановлено: превышен лимит времени генерации]\n"
+                break
+            text = chunk["choices"][0]["text"]
+            if text:
+                generated += text
+                pending += text
+                if stream_to_ui:
+                    # Keep a small initial buffer so short exact repeats can be
+                    # caught before rendering, then stream normally for UI
+                    # responsiveness on real companion turns.
+                    should_flush = (
+                        emitted
+                        or len(pending) >= 120
+                        or time.monotonic() - started >= 1.5
+                    )
+                    if should_flush:
+                        if not emitted:
+                            self._log_companion(
+                                "stream_flush",
+                                run_id=self.run_id,
+                                chars=len(pending),
+                                elapsed_ms=int((time.monotonic() - started) * 1000),
+                            )
+                        self.chunk_received.emit(pending)
+                        pending = ""
+                        emitted = True
+                if self._detect_loop(generated):
+                    pending += "\n[прервано: обнаружено зацикливание]"
+                    generated += "\n[прервано: обнаружено зацикливание]"
+                    break
+        if not stream_to_ui:
+            pending = generated
+        return generated, emitted, pending
 
     # ============================================================
     # Режим 2: chat completion (Vision)
@@ -267,9 +593,14 @@ class InferenceWorker(QThread):
         )
 
         generated = ""
+        started = time.monotonic()
         for chunk in stream:
             if self._stop:
                 self.chunk_received.emit("\n[остановлено]")
+                break
+            if time.monotonic() - started > self.max_generation_seconds:
+                self._stop = True
+                self.chunk_received.emit("\n[остановлено: превышен лимит времени генерации]\n")
                 break
             delta = chunk["choices"][0].get("delta", {})
             text = delta.get("content", "")
@@ -304,7 +635,7 @@ class InferenceWorker(QThread):
         "первый из": закрывающая ``` после открытия / следующий [FILE:] или
         [CREATE_FILE:] / явный закрывающий тег / конец текста.
         """
-        if not getattr(self.profile, "agent_mode", False):
+        if not getattr(self.profile, "agent_mode", False) or not self.allow_agent_actions:
             return
 
         actions = self._parse_agent_actions(text)
@@ -489,13 +820,14 @@ class InferenceWorker(QThread):
         return _LOOP_PATTERN.search(tail) is not None
 
     def _default_stops(self) -> list[str]:
+        # ВАЖНО: НЕ добавлять сюда "User:" / "Assistant:" / "USER:" — они рубят
+        # стрим посреди нормального ответа, если модель цитирует код типа
+        # `Assistant: helper()` или пишет "User: должен быть авторизован".
+        # Спецтокены ChatML / Llama-3 / Gemma безопасны — их модель никогда
+        # не выдаёт как обычный текст.
         return [
             "<|im_end|>",
             "<|eot_id|>",
             "<|end_of_text|>",
             "<end_of_turn>",
-            "User:",
-            "USER:",
-            "Assistant:",
-            "ASSISTANT:",
         ]

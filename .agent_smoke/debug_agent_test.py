@@ -1,0 +1,13 @@
+from tests.test_agent_tools import AgentToolFlowTests, AgentWorker, agent_profile, ToolCall, ToolResult
+case=AgentToolFlowTests('test_existing_project_divide_fallback_patches_and_verifies')
+case.setUp()
+case.prepare_existing_calculator_project()
+w=AgentWorker(agent_profile(), case.existing_calculator_task(), project_root=str(case.root))
+print('should before', flush=True)
+call=ToolCall(name='edit_file', args={'path':'app/calculator.py','old_str':'','new_str':'def divide(a, b):\n    return a / b\n'})
+res=ToolResult.error('[error: missing old_str]')
+print(w._should_attempt_existing_calculator_divide_fallback(call,res), flush=True)
+print('patch before', flush=True)
+lines=w._attempt_existing_calculator_divide_patch()
+print('after patch', len(lines), w._changed_files, flush=True)
+case.tearDown()

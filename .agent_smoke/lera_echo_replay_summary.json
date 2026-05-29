@@ -1,0 +1,202 @@
+{
+  "model": "Mistral-Nemo-12B-ArliAI-RPMax-v1.2.Q5_K_M.gguf",
+  "turns": 65,
+  "valid_turns": 65,
+  "all_passed": true,
+  "failures": [],
+  "short": [
+    {
+      "user": "Привет",
+      "response": "Алло! Как дела, друг?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.095,
+      "replay": false,
+      "loads": [
+        {
+          "event": "model_loading",
+          "path": "D:\\Zen Ai Editor\\models\\Mistral-Nemo-12B-ArliAI-RPMax-v1.2.Q5_K_M.gguf"
+        },
+        {
+          "event": "model_loaded",
+          "path": "D:\\Zen Ai Editor\\models\\Mistral-Nemo-12B-ArliAI-RPMax-v1.2.Q5_K_M.gguf",
+          "ok": true,
+          "error": ""
+        }
+      ],
+      "phase": "short"
+    },
+    {
+      "user": "Тут?",
+      "response": "Здесь, здесь! Всё нормально. У меня всё хорошо, а у тебя как?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.083,
+      "replay": false,
+      "loads": [],
+      "phase": "short"
+    },
+    {
+      "user": "Скажи новую фразу про кофе.",
+      "response": "Кофе — это вкусное зелье, которое превращает утро в волшебный день.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.105,
+      "replay": false,
+      "loads": [],
+      "phase": "short"
+    },
+    {
+      "user": "А теперь совсем другую про дождь.",
+      "response": "Дождь — это музыка неба, которая играет для нас каждый день.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.135,
+      "replay": false,
+      "loads": [],
+      "phase": "short"
+    },
+    {
+      "user": "Что ты сейчас делаешь?",
+      "response": "Я сижу на диване, смотрю сериал и пью чай. А что ты делаешь?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.381,
+      "replay": false,
+      "loads": [],
+      "phase": "short"
+    }
+  ],
+  "long_tail": [
+    {
+      "user": "msg-051: Тут?",
+      "response": "msg-052: Да, я тут. Как у тебя настроение?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.41,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-052: Продолжай",
+      "response": "msg-053: Продолжать что? Я готова выслушать всё, что ты хочешь сказать.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.366,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-053: Что думаешь?",
+      "response": "msg-054: Я думаю, что наша беседа полна тепла и искренности. А о чём бы ты хотел поговорить?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.253,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-054: Коротко ответь про музыку",
+      "response": "msg-055: Музыка — это ритм, который бьётся в такт с нашим дыханием.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.253,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-055: Теперь про тёплый свет",
+      "response": "msg-056: Тёплый свет — это лучи, которые обнимают нас в тёмный час.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.395,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-056: Маркер диалога",
+      "response": "msg-057: Привет! Как твоя жизнь?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.372,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-057: Привет",
+      "response": "msg-058: Привет, друг! Как у тебя дела?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.55,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-058: Тут?",
+      "response": "msg-059: Да, я тут. Как у тебя настроение?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.41,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-059: Продолжай",
+      "response": "msg-060: Продолжать что? Я здесь, чтобы выслушать всё, что ты хочешь сказать.",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.32,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    },
+    {
+      "user": "msg-060: Что думаешь?",
+      "response": "msg-061: Я думаю, что наша беседа полна доверия и понимания. А о чём бы ты хотел поговорить?",
+      "valid": true,
+      "worker_valid": true,
+      "block_reason": "",
+      "echo": false,
+      "echo_similarity": 0.253,
+      "replay": false,
+      "loads": [],
+      "phase": "long"
+    }
+  ]
+}

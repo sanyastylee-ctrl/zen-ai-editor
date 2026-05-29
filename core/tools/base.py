@@ -75,4 +75,4 @@ class Tool:
         return candidate
 
     def relpath(self, path: str) -> str:
-        return os.path.relpath(path, self.project_root)
+        return os.path.relpath(path, self.project_root).replace(os.sep, "/")

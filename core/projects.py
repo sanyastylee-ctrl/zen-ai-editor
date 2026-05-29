@@ -7,7 +7,7 @@
 - RAG-индексатор
 - Контекст кодера (_get_project_tree)
 
-История хранится в ~/.zen_ai/recent_projects.json — последние N открытых,
+История хранится в AppData/ZenAI/sessions/recent_projects.json — последние N открытых,
 LRU. Используется для меню "Недавние".
 
 ProjectManager — singleton (как ModelManager).
@@ -19,9 +19,12 @@ import json
 import os
 from pathlib import Path
 
+from .app_data import SESSIONS_DIR, migrate_legacy_file
 
-CONFIG_DIR = Path.home() / ".zen_ai"
+
+CONFIG_DIR = SESSIONS_DIR
 RECENT_FILE = CONFIG_DIR / "recent_projects.json"
+LEGACY_RECENT_FILE = Path.home() / ".zen_ai" / "recent_projects.json"
 MAX_RECENT = 8
 
 
@@ -39,6 +42,7 @@ class ProjectManager:
     def __init__(self) -> None:
         self._current: str = os.getcwd()
         self._recent: list[str] = []
+        migrate_legacy_file(LEGACY_RECENT_FILE, RECENT_FILE)
         self._load()
 
     # ---------- public ----------

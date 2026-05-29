@@ -115,8 +115,14 @@ class SandboxWorker(QThread):
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
 
+            # На Windows cmd.exe по умолчанию cp1251/cp866 — явно переключаем
+            # в UTF-8 через chcp 65001 перед командой пользователя.
+            cmd = self.command
+            if sys.platform == "win32":
+                cmd = f"chcp 65001 > nul 2>&1 & {cmd}"
+
             self._proc = subprocess.Popen(
-                self.command,
+                cmd,
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

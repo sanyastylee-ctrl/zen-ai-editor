@@ -8,7 +8,7 @@
 zen-ai-editor/
 ├── main.py                 — точка входа
 ├── core/
-│   ├── profiles.py         — AIProfile, ProfileManager (JSON в ~/.zen_ai/)
+│   ├── profiles.py         — AIProfile, ProfileManager (JSON в %APPDATA%/ZenAI/settings/)
 │   ├── model_manager.py    — менеджер моделей с LRU-кэшем
 │   ├── token_budget.py     — обрезка контекста под n_ctx
 │   ├── chat_templates.py   — ChatML/Llama3/Mistral/Gemma/DeepSeek
@@ -67,7 +67,7 @@ pip install llama-cpp-python --extra-index-url \
 
 ## Кодер с RAG
 
-Сайдбар → **⟳ Индекс RAG** → проект индексируется через faiss + MiniLM (кэш в `.zen_ai/`).
+Сайдбар → **⟳ Индекс RAG** → проект индексируется через faiss + MiniLM (кэш в `%APPDATA%\ZenAI\memory\`).
 Включить RAG для кодера: Настройки → **Использовать RAG для кодера**.
 
 ## Хоткеи
@@ -77,3 +77,27 @@ pip install llama-cpp-python --extra-index-url \
 | Сохранить файл | Ctrl+S |
 | Отправить в чат | Enter |
 | Остановить генерацию | кнопка ⏹ |
+
+## Данные приложения
+
+Постоянные данные хранятся вне открытого проекта, в `%APPDATA%\ZenAI\`:
+
+- `chats/` — JSON-сессии чатов;
+- `sessions/` — состояние последнего профиля и недавних проектов;
+- `memory/` — кэш RAG по проектам;
+- `settings/` — настройки и профили.
+
+При первом запуске после обновления существующие файлы из `~/.zen_ai/` и
+проектный RAG-кэш читаются через одноразовое копирование в новое хранилище.
+
+## Сборка Windows
+
+Для portable-сборки в режиме `onedir`:
+
+```bash
+pip install pyinstaller
+pyinstaller ZenAI.spec --clean
+```
+
+Результат появится в `dist/ZenAI/`. Папка `models/` с `.gguf` должна находиться
+рядом с `ZenAI.exe`; модели не включаются в сборку из-за их размера.

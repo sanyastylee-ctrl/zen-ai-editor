@@ -1,7 +1,9 @@
 import os
 import json
+from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
+from core.app_data import migrate_legacy_file, project_memory_dir
 
 try:
     import faiss
@@ -18,9 +20,14 @@ class ProjectRAG:
         self._chunk_meta = []
 
     def get_storage_dir(self):
-        d = os.path.join(os.getcwd(), '.zen_ai')
-        os.makedirs(d, exist_ok=True)
-        return d
+        d = project_memory_dir(os.getcwd())
+        legacy = os.path.join(os.getcwd(), '.zen_ai')
+        for filename in ('project.faiss', 'meta.json', 'chunks.json'):
+            migrate_legacy_file(
+                Path(legacy) / filename,
+                d / filename,
+            )
+        return str(d)
 
     def _ensure_model(self):
         if self._model is None and RAG_AVAILABLE:
@@ -45,9 +52,12 @@ class ProjectRAG:
     def save_index(self):
         if not RAG_AVAILABLE or not self._index: return
         d = self.get_storage_dir()
-        faiss.write_index(self._index, os.path.join(d, 'project.faiss'))
-        with open(os.path.join(d, 'meta.json'),   'w', encoding='utf-8') as f: json.dump(self._chunk_meta, f)
-        with open(os.path.join(d, 'chunks.json'), 'w', encoding='utf-8') as f: json.dump(self._chunks, f)
+        try:
+            faiss.write_index(self._index, os.path.join(d, 'project.faiss'))
+            with open(os.path.join(d, 'meta.json'),   'w', encoding='utf-8') as f: json.dump(self._chunk_meta, f)
+            with open(os.path.join(d, 'chunks.json'), 'w', encoding='utf-8') as f: json.dump(self._chunks, f)
+        except OSError:
+            pass
 
     def index_project(self, root_dir, extensions=('.py','.js','.ts','.md','.txt'), chunk_size=40, overlap=10):
         if not RAG_AVAILABLE: return 0

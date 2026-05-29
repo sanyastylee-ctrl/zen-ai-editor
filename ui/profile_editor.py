@@ -16,9 +16,13 @@ from PyQt6.QtWidgets import (
     QLabel, QFileDialog, QFrame, QCheckBox,
 )
 
-from core.profiles import AIProfile, ProfileKind, ChatTemplate, DEFAULT_AGENT_CODER_PROMPT
+from core.profiles import (
+    AIProfile, ProfileKind, ChatTemplate, DEFAULT_AGENT_CODER_PROMPT,
+    DEFAULT_RESEARCHER_PROMPT,
+)
 from core.paths import list_available_models
 from core.token_budget import TokenBudget
+from ui.chat.styles import Palette, form_controls_qss, mono_font
 from .persona_editor import PersonaEditor
 
 
@@ -59,6 +63,14 @@ Reply in Russian.""",
 Be concrete, reference what you actually see. Reply in Russian.""",
 }
 
+PROMPT_PRESETS_RESEARCHER = {
+    "По умолчанию (Поисковик)": "default",
+    "Короткие ответы с источниками": """You are ZenAI Researcher. Answer briefly and clearly.
+Use web search for fresh/current facts. Never invent sources. If search was used, cite sources.""",
+    "Сравнение вариантов": """You are ZenAI Researcher. Compare options by criteria, tradeoffs, risks, and sources.
+Use web search for current products, model versions, prices, and releases. Cite sources.""",
+}
+
 
 class ProfileEditor(QWidget):
     """Виджет редактора. Сам не показывает кнопки Save/Cancel — это делает диалог-обёртка."""
@@ -86,6 +98,26 @@ class ProfileEditor(QWidget):
         p.system_prompt = self.prompt_edit.toPlainText()
         if p.kind == ProfileKind.CODER and hasattr(self, "agent_mode_check"):
             p.agent_mode = self.agent_mode_check.isChecked()
+        if p.kind == ProfileKind.CODER and hasattr(self, "vision_assist_check"):
+            p.enable_vision_assist = self.vision_assist_check.isChecked()
+            if hasattr(self, "vision_model_combo"):
+                value = self.vision_model_combo.currentText()
+                p.vision_model_file = value if value and not value.startswith("(") else ""
+            if hasattr(self, "mmproj_combo"):
+                value = self.mmproj_combo.currentText()
+                p.mmproj_file = value if value and not value.startswith("(") else ""
+            if hasattr(self, "vision_handler_combo"):
+                p.vision_handler = self.vision_handler_combo.currentData() or ""
+            if hasattr(self, "max_visual_context_spin"):
+                p.max_visual_context_chars = self.max_visual_context_spin.value()
+            if hasattr(self, "vision_policy_combo"):
+                p.vision_first_policy = self.vision_policy_combo.currentData() or "auto"
+        if p.kind == ProfileKind.RESEARCHER and hasattr(self, "search_enabled_check"):
+            p.search_enabled = self.search_enabled_check.isChecked()
+            p.max_search_results = self.max_search_results_spin.value()
+            p.max_pages_to_read = self.max_pages_to_read_spin.value()
+            p.require_sources_for_fresh_info = self.require_sources_check.isChecked()
+            p.answer_style = self.answer_style_combo.currentData() or "detailed"
 
         p.temperature = self.temp_spin.value()
         p.top_p = self.top_p_spin.value()
@@ -119,14 +151,14 @@ class ProfileEditor(QWidget):
         header = QHBoxLayout()
         header.setContentsMargins(4, 4, 4, 4)
         name_label = QLabel("Имя профиля:")
-        name_label.setStyleSheet("color:#B0B0B0; font-size:12px;")
+        name_label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px;")
         header.addWidget(name_label)
         self.name_edit = QLineEdit()
         self.name_edit.setMaximumWidth(280)
         header.addWidget(self.name_edit)
         header.addStretch()
         kind_label = QLabel(self._kind_caption())
-        kind_label.setStyleSheet("color:#888; font-size:11px;")
+        kind_label.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px;")
         header.addWidget(kind_label)
         outer.addLayout(header)
 
@@ -160,16 +192,16 @@ class ProfileEditor(QWidget):
         self._refresh_models()
         model_row.addWidget(self.model_combo, 1)
 
-        refresh_btn = QPushButton("⟳")
-        refresh_btn.setFixedWidth(34)
-        refresh_btn.setObjectName("secondary")
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.setFixedWidth(82)
+        refresh_btn.setObjectName("secondaryCompact")
         refresh_btn.setToolTip("Обновить список моделей из /models")
         refresh_btn.clicked.connect(self._refresh_models)
         model_row.addWidget(refresh_btn)
 
-        browse_btn = QPushButton("…")
-        browse_btn.setFixedWidth(34)
-        browse_btn.setObjectName("secondary")
+        browse_btn = QPushButton("Выбрать")
+        browse_btn.setFixedWidth(78)
+        browse_btn.setObjectName("secondaryCompact")
         browse_btn.setToolTip("Выбрать .gguf файл с диска")
         browse_btn.clicked.connect(self._browse_model)
         model_row.addWidget(browse_btn)
@@ -202,16 +234,117 @@ class ProfileEditor(QWidget):
         )
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet("color:#888; font-size:11px; padding:4px;")
+        hint.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px; padding:4px;")
         form.addRow("", hint)
 
         # === Vision-секция (только для Vision-профилей) ===
+        if self._profile.kind == ProfileKind.CODER:
+            sep_label = QLabel("Vision Assist / Глаза")
+            sep_label.setStyleSheet(
+                f"color:{Palette.ACCENT_GREEN}; font-size:11px; font-weight:bold; "
+                f"padding:8px 0 4px 0; border-top:1px solid {Palette.BORDER}; margin-top:8px;"
+            )
+            form.addRow(sep_label)
+
+            self.vision_assist_check = QCheckBox("Анализировать прикреплённые скриншоты перед Coder Agent")
+            form.addRow("Vision Assist:", self.vision_assist_check)
+
+            vision_model_row = QHBoxLayout()
+            self.vision_model_combo = QComboBox()
+            self.vision_model_combo.setMinimumWidth(280)
+            self._refresh_vision_model_list()
+            vision_model_row.addWidget(self.vision_model_combo, 1)
+
+            vision_model_refresh = QPushButton("Обновить")
+            vision_model_refresh.setFixedWidth(82)
+            vision_model_refresh.setObjectName("secondaryCompact")
+            vision_model_refresh.setToolTip("Обновить список vision-моделей")
+            vision_model_refresh.clicked.connect(self._refresh_vision_model_list)
+            vision_model_row.addWidget(vision_model_refresh)
+            form.addRow("Vision модель:", self._wrap_row(vision_model_row))
+
+            mmproj_row = QHBoxLayout()
+            self.mmproj_combo = QComboBox()
+            self.mmproj_combo.setMinimumWidth(280)
+            self._refresh_mmproj_list()
+            mmproj_row.addWidget(self.mmproj_combo, 1)
+
+            mmproj_refresh = QPushButton("Обновить")
+            mmproj_refresh.setFixedWidth(82)
+            mmproj_refresh.setObjectName("secondaryCompact")
+            mmproj_refresh.setToolTip("Обновить список mmproj файлов")
+            mmproj_refresh.clicked.connect(self._refresh_mmproj_list)
+            mmproj_row.addWidget(mmproj_refresh)
+            form.addRow("mmproj файл:", self._wrap_row(mmproj_row))
+
+            self.vision_handler_combo = QComboBox()
+            self._fill_vision_handlers(self.vision_handler_combo)
+            form.addRow("Vision handler:", self.vision_handler_combo)
+
+            self.max_visual_context_spin = QSpinBox()
+            self.max_visual_context_spin.setRange(1000, 12000)
+            self.max_visual_context_spin.setSingleStep(500)
+            self.max_visual_context_spin.setSuffix(" символов")
+            form.addRow("Visual context:", self.max_visual_context_spin)
+
+            self.vision_policy_combo = QComboBox()
+            self.vision_policy_combo.addItem("Auto: только когда есть изображение", "auto")
+            self.vision_policy_combo.addItem("Always: всегда сначала Vision при изображении", "always")
+            self.vision_policy_combo.addItem("Never: не запускать Vision", "never")
+            form.addRow("Vision first:", self.vision_policy_combo)
+
+            vhint = QLabel(
+                "Vision Assist не редактирует файлы и не запускает терминал. "
+                "Он только создаёт compact visual_context, который затем получает Кодер."
+            )
+            vhint.setWordWrap(True)
+            vhint.setTextFormat(Qt.TextFormat.RichText)
+            vhint.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px; padding:4px;")
+            form.addRow("", vhint)
+
+        if self._profile.kind == ProfileKind.RESEARCHER:
+            sep_label = QLabel("Поисковик / Researcher")
+            sep_label.setStyleSheet(
+                f"color:{Palette.ACCENT_GREEN}; font-size:11px; font-weight:bold; "
+                f"padding:8px 0 4px 0; border-top:1px solid {Palette.BORDER}; margin-top:8px;"
+            )
+            form.addRow(sep_label)
+
+            self.search_enabled_check = QCheckBox("Разрешить web-search pipeline для свежих фактов")
+            form.addRow("Интернет-поиск:", self.search_enabled_check)
+
+            self.max_search_results_spin = QSpinBox()
+            self.max_search_results_spin.setRange(1, 20)
+            form.addRow("Результатов поиска:", self.max_search_results_spin)
+
+            self.max_pages_to_read_spin = QSpinBox()
+            self.max_pages_to_read_spin.setRange(0, 10)
+            form.addRow("Страниц читать:", self.max_pages_to_read_spin)
+
+            self.require_sources_check = QCheckBox("Требовать источники для актуальной информации")
+            form.addRow("Fresh info:", self.require_sources_check)
+
+            self.answer_style_combo = QComboBox()
+            self.answer_style_combo.addItem("Коротко", "short")
+            self.answer_style_combo.addItem("Подробно", "detailed")
+            self.answer_style_combo.addItem("Сравнение", "compare")
+            form.addRow("Стиль ответа:", self.answer_style_combo)
+
+            rhint = QLabel(
+                "Если backend поиска не настроен, Поисковик честно сообщит, что web search недоступен, "
+                "и не будет придумывать источники."
+            )
+            rhint.setWordWrap(True)
+            rhint.setTextFormat(Qt.TextFormat.RichText)
+            rhint.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px; padding:4px;")
+            form.addRow("", rhint)
+
         if self._profile.kind == ProfileKind.VISION:
             # разделитель
             sep_label = QLabel("Vision (распознавание изображений)")
             sep_label.setStyleSheet(
-                "color:#4EC9B0; font-size:11px; font-weight:bold; "
-                "padding:8px 0 4px 0; border-top:1px solid #3A3A3A; margin-top:8px;"
+                f"color:{Palette.ACCENT_GREEN}; font-size:11px; font-weight:bold; "
+                f"padding:8px 0 4px 0; border-top:1px solid {Palette.BORDER}; margin-top:8px;"
             )
             form.addRow(sep_label)
 
@@ -222,9 +355,9 @@ class ProfileEditor(QWidget):
             self._refresh_mmproj_list()
             mmproj_row.addWidget(self.mmproj_combo, 1)
 
-            mmproj_refresh = QPushButton("⟳")
-            mmproj_refresh.setFixedWidth(34)
-            mmproj_refresh.setObjectName("secondary")
+            mmproj_refresh = QPushButton("Обновить")
+            mmproj_refresh.setFixedWidth(82)
+            mmproj_refresh.setObjectName("secondaryCompact")
             mmproj_refresh.setToolTip("Обновить список mmproj файлов")
             mmproj_refresh.clicked.connect(self._refresh_mmproj_list)
             mmproj_row.addWidget(mmproj_refresh)
@@ -232,21 +365,7 @@ class ProfileEditor(QWidget):
 
             # тип handler'а
             self.vision_handler_combo = QComboBox()
-            from core.model_manager import available_vision_handlers
-            available = available_vision_handlers()
-            handler_labels = {
-                "qwen25vl": "Qwen 2.5 VL (рекомендуется для Qwen2.5-VL)",
-                "llava15": "LLaVA 1.5",
-                "llava16": "LLaVA 1.6",
-                "minicpmv26": "MiniCPM-V 2.6",
-            }
-            if not available:
-                self.vision_handler_combo.addItem("(в установленной llama-cpp нет vision)", "")
-                self.vision_handler_combo.setEnabled(False)
-            else:
-                for handler_id in available:
-                    label = handler_labels.get(handler_id, handler_id)
-                    self.vision_handler_combo.addItem(label, handler_id)
+            self._fill_vision_handlers(self.vision_handler_combo)
             form.addRow("Vision handler:", self.vision_handler_combo)
 
             vhint = QLabel(
@@ -255,7 +374,7 @@ class ProfileEditor(QWidget):
             )
             vhint.setWordWrap(True)
             vhint.setTextFormat(Qt.TextFormat.RichText)
-            vhint.setStyleSheet("color:#888; font-size:11px; padding:4px;")
+            vhint.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px; padding:4px;")
             form.addRow("", vhint)
 
         return w
@@ -269,7 +388,7 @@ class ProfileEditor(QWidget):
         # пресеты
         preset_row = QHBoxLayout()
         preset_label = QLabel("Шаблон:")
-        preset_label.setStyleSheet("color:#B0B0B0; font-size:12px;")
+        preset_label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px;")
         preset_row.addWidget(preset_label)
 
         self.preset_combo = QComboBox()
@@ -277,6 +396,8 @@ class ProfileEditor(QWidget):
             presets = PROMPT_PRESETS_CODER
         elif self._profile.kind == ProfileKind.VISION:
             presets = PROMPT_PRESETS_VISION
+        elif self._profile.kind == ProfileKind.RESEARCHER:
+            presets = PROMPT_PRESETS_RESEARCHER
         else:
             presets = PROMPT_PRESETS_COMPANION
         self.preset_combo.addItem("— не менять —", None)
@@ -291,16 +412,19 @@ class ProfileEditor(QWidget):
             vars_hint = QLabel(
                 "<b>Переменные:</b> {character_name}, {age}, {user_name}, {personality}, "
                 "{speaking_style}, {appearance}, {background}, {current_mood}, {relationship_to_user}. "
-                "Заполняются на вкладке <b>Персона</b>."
+                "Дополнительные настройки CompanionState и памяти заполняются на вкладке <b>Персона</b>."
             )
             vars_hint.setWordWrap(True)
             vars_hint.setTextFormat(Qt.TextFormat.RichText)
-            vars_hint.setStyleSheet("color:#888; font-size:11px; padding:6px; background:#1A1A1A; border-radius:4px;")
+            vars_hint.setStyleSheet(
+                f"color:{Palette.TEXT_DIM}; font-size:11px; padding:8px;"
+                f"background:{Palette.BG_CODE}; border:1px solid {Palette.BORDER}; border-radius:6px;"
+            )
             layout.addWidget(vars_hint)
 
         # сам промпт
         self.prompt_edit = QTextEdit()
-        self.prompt_edit.setFont(QFont("Consolas", 11))
+        self.prompt_edit.setFont(mono_font(11))
         self.prompt_edit.setPlaceholderText("Системный промпт...")
         self.prompt_edit.textChanged.connect(self._update_prompt_counter)
         layout.addWidget(self.prompt_edit, 1)
@@ -308,7 +432,7 @@ class ProfileEditor(QWidget):
         # счётчик токенов промпта
         counter_row = QHBoxLayout()
         self.prompt_counter = QLabel("0 токенов")
-        self.prompt_counter.setStyleSheet("color:#888; font-size:11px;")
+        self.prompt_counter.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px;")
         counter_row.addWidget(self.prompt_counter)
         counter_row.addStretch()
         layout.addLayout(counter_row)
@@ -373,7 +497,7 @@ class ProfileEditor(QWidget):
         hint = QLabel(hint_text)
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet("color:#888; font-size:11px; padding:6px;")
+        hint.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px; padding:6px;")
         form.addRow("", hint)
 
         return w
@@ -408,6 +532,38 @@ class ProfileEditor(QWidget):
         self.stop_edit.setText(", ".join(p.stop_sequences))
         if p.kind == ProfileKind.CODER and hasattr(self, "agent_mode_check"):
             self.agent_mode_check.setChecked(getattr(p, "agent_mode", False))
+        if p.kind == ProfileKind.CODER and hasattr(self, "vision_assist_check"):
+            self.vision_assist_check.setChecked(getattr(p, "enable_vision_assist", False))
+            if hasattr(self, "vision_model_combo"):
+                value = getattr(p, "vision_model_file", "")
+                if value and self.vision_model_combo.findText(value) == -1:
+                    self.vision_model_combo.addItem(value)
+                if value:
+                    self.vision_model_combo.setCurrentText(value)
+            if hasattr(self, "mmproj_combo"):
+                value = getattr(p, "mmproj_file", "")
+                if value and self.mmproj_combo.findText(value) == -1:
+                    self.mmproj_combo.addItem(value)
+                if value:
+                    self.mmproj_combo.setCurrentText(value)
+            if hasattr(self, "vision_handler_combo") and getattr(p, "vision_handler", ""):
+                idx = self.vision_handler_combo.findData(p.vision_handler)
+                if idx >= 0:
+                    self.vision_handler_combo.setCurrentIndex(idx)
+            if hasattr(self, "max_visual_context_spin"):
+                self.max_visual_context_spin.setValue(getattr(p, "max_visual_context_chars", 4000))
+            if hasattr(self, "vision_policy_combo"):
+                idx = self.vision_policy_combo.findData(getattr(p, "vision_first_policy", "auto"))
+                if idx >= 0:
+                    self.vision_policy_combo.setCurrentIndex(idx)
+        if p.kind == ProfileKind.RESEARCHER and hasattr(self, "search_enabled_check"):
+            self.search_enabled_check.setChecked(getattr(p, "search_enabled", True))
+            self.max_search_results_spin.setValue(getattr(p, "max_search_results", 5))
+            self.max_pages_to_read_spin.setValue(getattr(p, "max_pages_to_read", 3))
+            self.require_sources_check.setChecked(getattr(p, "require_sources_for_fresh_info", True))
+            idx = self.answer_style_combo.findData(getattr(p, "answer_style", "detailed"))
+            if idx >= 0:
+                self.answer_style_combo.setCurrentIndex(idx)
 
         if self.persona_editor is not None:
             self.persona_editor.set_persona(p.persona)
@@ -457,6 +613,39 @@ class ProfileEditor(QWidget):
             if current and current in mmprojs:
                 self.mmproj_combo.setCurrentText(current)
 
+    def _refresh_vision_model_list(self) -> None:
+        if not hasattr(self, "vision_model_combo"):
+            return
+        current = self.vision_model_combo.currentText() if self.vision_model_combo.count() else ""
+        self.vision_model_combo.clear()
+        models = [m for m in list_available_models() if "mmproj" not in m.lower()]
+        if not models:
+            self.vision_model_combo.addItem("(нет vision .gguf в папке models/)")
+            self.vision_model_combo.setEnabled(False)
+        else:
+            self.vision_model_combo.setEnabled(True)
+            for m in models:
+                self.vision_model_combo.addItem(m)
+            if current and current in models:
+                self.vision_model_combo.setCurrentText(current)
+
+    @staticmethod
+    def _fill_vision_handlers(combo: QComboBox) -> None:
+        from core.model_manager import available_vision_handlers
+        available = available_vision_handlers()
+        handler_labels = {
+            "qwen25vl": "Qwen 2.5 VL (рекомендуется для Qwen2.5-VL)",
+            "llava15": "LLaVA 1.5",
+            "llava16": "LLaVA 1.6",
+            "minicpmv26": "MiniCPM-V 2.6",
+        }
+        if not available:
+            combo.addItem("(в установленной llama-cpp нет vision)", "")
+            combo.setEnabled(False)
+        else:
+            for handler_id in available:
+                combo.addItem(handler_labels.get(handler_id, handler_id), handler_id)
+
     def _browse_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Выберите .gguf файл", "", "GGUF (*.gguf)"
@@ -480,6 +669,8 @@ class ProfileEditor(QWidget):
                 text = DEFAULT_CODER_PROMPT
             elif self._profile.kind == ProfileKind.VISION:
                 text = DEFAULT_VISION_PROMPT
+            elif self._profile.kind == ProfileKind.RESEARCHER:
+                text = DEFAULT_RESEARCHER_PROMPT
             else:
                 text = DEFAULT_COMPANION_PROMPT
         else:
@@ -497,11 +688,11 @@ class ProfileEditor(QWidget):
         self.prompt_counter.setText(f"~{toks} токенов")
         # подкрашиваем если жирный промпт
         if toks > 800:
-            self.prompt_counter.setStyleSheet("color:#CE9178; font-size:11px;")
+            self.prompt_counter.setStyleSheet(f"color:{Palette.ACCENT_RED}; font-size:11px;")
         elif toks > 400:
-            self.prompt_counter.setStyleSheet("color:#CDA040; font-size:11px;")
+            self.prompt_counter.setStyleSheet(f"color:{Palette.ACCENT_AMBER}; font-size:11px;")
         else:
-            self.prompt_counter.setStyleSheet("color:#888; font-size:11px;")
+            self.prompt_counter.setStyleSheet(f"color:{Palette.TEXT_DIM}; font-size:11px;")
 
     # ---------- helpers ----------
 
@@ -509,6 +700,7 @@ class ProfileEditor(QWidget):
         return {
             ProfileKind.CODER: "тип: кодер",
             ProfileKind.COMPANION: "тип: компаньон",
+            ProfileKind.RESEARCHER: "тип: поисковик",
             ProfileKind.VISION: "тип: vision (изображения)",
             ProfileKind.GENERIC: "тип: общий",
         }.get(self._profile.kind, "")
@@ -533,49 +725,27 @@ class ProfileEditor(QWidget):
 
     @staticmethod
     def _stylesheet() -> str:
-        return """
-            QTabWidget::pane {
-                border: 1px solid #3A3A3A;
-                background: #252526;
-                border-radius: 4px;
-            }
-            QTabBar::tab {
+        return form_controls_qss() + f"""
+            QTabWidget::pane {{
+                border: 1px solid {Palette.BORDER};
+                background: {Palette.BG_ASSISTANT};
+                border-radius: 8px;
+                top: -1px;
+            }}
+            QTabBar::tab {{
                 background: transparent;
-                color: #888;
-                padding: 7px 18px;
+                color: {Palette.TEXT_SECONDARY};
+                padding: 8px 18px;
                 font-size: 12px;
                 border: none;
-            }
-            QTabBar::tab:selected {
-                color: #D4D4D4;
-                border-bottom: 2px solid #0E639C;
-            }
-            QTabBar::tab:hover {
-                color: #B0B0B0;
-            }
-            QLabel { color: #B0B0B0; font-size: 12px; }
-            QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-                background: #1E1E1E;
-                color: #E0E0E0;
-                border: 1px solid #3A3A3A;
-                border-radius: 4px;
-                padding: 5px 8px;
-                font-size: 12px;
-                selection-background-color: #0E639C;
-            }
-            QLineEdit:focus, QTextEdit:focus, QComboBox:focus,
-            QSpinBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #0E639C;
-            }
-            QPushButton {
-                background-color: #0E639C; color: white;
-                border-radius: 4px; padding: 6px 12px;
-                font-size: 12px; font-weight: 500; border: none;
-            }
-            QPushButton:hover { background-color: #1177BB; }
-            QPushButton#secondary {
-                background-color: #3A3A3A; color: #D4D4D4;
-                border: 1px solid #4A4A4A;
-            }
-            QPushButton#secondary:hover { background-color: #4A4A4A; }
+                border-bottom: 2px solid transparent;
+            }}
+            QTabBar::tab:selected {{
+                color: {Palette.TEXT_PRIMARY};
+                border-bottom: 2px solid {Palette.ACCENT};
+            }}
+            QTabBar::tab:hover {{
+                color: {Palette.TEXT_PRIMARY};
+                background: rgba(167,139,250,0.06);
+            }}
         """

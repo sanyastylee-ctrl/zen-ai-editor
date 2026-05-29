@@ -28,7 +28,11 @@ from PyQt6.QtWidgets import (
 from core.profiles import (
     AIProfile, ProfileKind, ProfileManager, ChatTemplate,
     DEFAULT_CODER_PROMPT, DEFAULT_COMPANION_PROMPT, DEFAULT_VISION_PROMPT,
+    DEFAULT_CODER_MODEL_FILE, DEFAULT_COMPANION_MODEL_FILE,
+    DEFAULT_VISION_MODEL_FILE, DEFAULT_VISION_MMPROJ_FILE,
+    DEFAULT_RESEARCHER_PROMPT, DEFAULT_RESEARCHER_MODEL_FILE,
 )
+from ui.chat.styles import Palette, form_controls_qss
 from .profile_editor import ProfileEditor
 
 
@@ -68,7 +72,7 @@ class SettingsDialog(QDialog):
         header_layout.setSpacing(6)
 
         profile_label = QLabel("Профиль:")
-        profile_label.setStyleSheet("color:#B0B0B0; font-size:12px;")
+        profile_label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px;")
         header_layout.addWidget(profile_label)
 
         self.profile_buttons_container = QHBoxLayout()
@@ -82,7 +86,7 @@ class SettingsDialog(QDialog):
         header_layout.addWidget(self.new_btn)
 
         self.delete_btn = QPushButton("🗑 Удалить")
-        self.delete_btn.setObjectName("secondary")
+        self.delete_btn.setObjectName("danger")
         self.delete_btn.clicked.connect(self._on_delete_profile)
         header_layout.addWidget(self.delete_btn)
 
@@ -119,7 +123,7 @@ class SettingsDialog(QDialog):
         layout.setSpacing(4)
 
         title = QLabel("Общие настройки")
-        title.setStyleSheet("color:#888; font-size:11px; font-weight:bold; padding:2px 0;")
+        title.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:11px; font-weight:bold; padding:2px 0;")
         layout.addWidget(title)
 
         row = QHBoxLayout()
@@ -141,10 +145,13 @@ class SettingsDialog(QDialog):
         agent_row = QHBoxLayout()
         agent_row.setSpacing(10)
         agent_label = QLabel("Agent confirmation:")
-        agent_label.setStyleSheet("color:#B0B0B0; font-size:12px;")
+        agent_label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px;")
         agent_row.addWidget(agent_label)
 
         self.agent_policy_combo = QComboBox()
+        self.agent_policy_combo.setObjectName("compact_combo")
+        self.agent_policy_combo.setMinimumWidth(150)
+        self.agent_policy_combo.setMaximumWidth(190)
         self.agent_policy_combo.addItem("Confirm changes", "confirm_changes")
         self.agent_policy_combo.addItem("Auto-confirm", "auto_confirm")
         self.agent_policy_combo.addItem("Confirm all", "confirm_all")
@@ -213,7 +220,8 @@ class SettingsDialog(QDialog):
         icon = {
             ProfileKind.CODER: "⌨",
             ProfileKind.COMPANION: "♡",
-            ProfileKind.VISION: "👁",
+            ProfileKind.RESEARCHER: "⌕",
+            ProfileKind.VISION: "◉",
             ProfileKind.GENERIC: "○",
         }.get(profile.kind, "○")
         return f"{icon}  {profile.name}"
@@ -232,6 +240,7 @@ class SettingsDialog(QDialog):
         kinds = {
             "Компаньон (живой персонаж)": ProfileKind.COMPANION,
             "Кодер": ProfileKind.CODER,
+            "Поисковик / Исследователь": ProfileKind.RESEARCHER,
             "Vision (изображения)": ProfileKind.VISION,
             "Общий": ProfileKind.GENERIC,
         }
@@ -249,21 +258,52 @@ class SettingsDialog(QDialog):
         # создаём
         defaults_by_kind = {
             ProfileKind.CODER: dict(
+                model_file=DEFAULT_CODER_MODEL_FILE,
                 system_prompt=DEFAULT_CODER_PROMPT,
                 temperature=0.2, top_p=0.9, top_k=20,
-                repeat_penalty=1.05, max_tokens=4096, n_ctx=8192,
+                repeat_penalty=1.1, max_tokens=4096, n_ctx=10240,
+                n_gpu_layers=-1,
             ),
             ProfileKind.COMPANION: dict(
+                model_file=DEFAULT_COMPANION_MODEL_FILE,
                 system_prompt=DEFAULT_COMPANION_PROMPT,
-                temperature=0.85, top_p=0.95, top_k=50,
-                repeat_penalty=1.15, max_tokens=1024, n_ctx=8192,
-                persona={"character_name": name.strip(), "user_name": "", "current_mood": "спокойное"},
+                temperature=0.9, top_p=0.95, top_k=50,
+                repeat_penalty=1.09, max_tokens=2048, n_ctx=8192,
+                n_gpu_layers=-1,
+                persona={
+                    "character_name": name.strip(),
+                    "user_name": "",
+                    "current_mood": "спокойное",
+                    "companion_mode": "chat",
+                    "tenderness": "7",
+                    "playfulness": "6",
+                    "initiative": "5",
+                    "romance": "5",
+                    "humor": "5",
+                    "autonomy": "5",
+                    "memory_enabled": "true",
+                },
             ),
             ProfileKind.VISION: dict(
+                model_file=DEFAULT_VISION_MODEL_FILE,
+                mmproj_file=DEFAULT_VISION_MMPROJ_FILE,
                 system_prompt=DEFAULT_VISION_PROMPT,
                 temperature=0.3, top_p=0.9, top_k=40,
                 repeat_penalty=1.05, max_tokens=2048, n_ctx=8192,
+                n_gpu_layers=-1,
                 vision_handler="qwen25vl",
+            ),
+            ProfileKind.RESEARCHER: dict(
+                model_file=DEFAULT_RESEARCHER_MODEL_FILE,
+                system_prompt=DEFAULT_RESEARCHER_PROMPT,
+                temperature=0.35, top_p=0.9, top_k=40,
+                repeat_penalty=1.08, max_tokens=2048, n_ctx=8192,
+                n_gpu_layers=-1,
+                search_enabled=True,
+                max_search_results=5,
+                max_pages_to_read=3,
+                require_sources_for_fresh_info=True,
+                answer_style="detailed",
             ),
             ProfileKind.GENERIC: dict(
                 system_prompt="You are a helpful assistant.",
@@ -332,47 +372,32 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _stylesheet() -> str:
-        return """
-            QDialog { background-color: #1E1E1E; color: #D4D4D4; }
-            QFrame#header { background: #252526; border-bottom: 1px solid #3A3A3A; }
-            QFrame#general_section { background: #252526; border-top: 1px solid #3A3A3A; }
-            QLabel { color: #D4D4D4; }
-            QCheckBox { color: #D4D4D4; font-size: 12px; padding: 2px; }
-            QCheckBox::indicator {
-                width: 14px; height: 14px;
-                border: 1px solid #555; border-radius: 3px;
-                background: #1E1E1E;
-            }
-            QCheckBox::indicator:checked {
-                background: #0E639C; border-color: #0E639C;
-            }
-            QPushButton {
-                background-color: #0E639C; color: white;
-                border-radius: 4px; padding: 7px 16px;
-                font-size: 12px; font-weight: 500; border: none;
-            }
-            QPushButton:hover { background-color: #1177BB; }
-            QPushButton#secondary {
-                background-color: transparent; color: #B0B0B0;
-                border: 1px solid #3A3A3A;
-            }
-            QPushButton#secondary:hover {
-                background-color: #2A2A2A; color: #E0E0E0;
-                border-color: #4A4A4A;
-            }
-            QPushButton#profile_tab {
+        return form_controls_qss() + f"""
+            QDialog {{ background-color: {Palette.BG_APP}; color: {Palette.TEXT_PRIMARY}; }}
+            QFrame#header {{
+                background: {Palette.BG_ASSISTANT};
+                border-bottom: 1px solid {Palette.BORDER};
+            }}
+            QFrame#general_section {{
+                background: {Palette.BG_ASSISTANT};
+                border-top: 1px solid {Palette.BORDER};
+            }}
+            QPushButton#profile_tab {{
                 background: transparent;
-                color: #888;
+                color: {Palette.TEXT_SECONDARY};
                 border: 1px solid transparent;
-                border-radius: 4px;
-                padding: 6px 14px;
-                font-weight: 500;
-            }
-            QPushButton#profile_tab:hover {
-                background: #2A2A2A; color: #D4D4D4;
-            }
-            QPushButton#profile_tab:checked {
-                background: #0E639C; color: white;
-            }
-            QStackedWidget { background: #1E1E1E; }
+                border-radius: 8px;
+                padding: 7px 14px;
+                font-weight: 600;
+            }}
+            QPushButton#profile_tab:hover {{
+                background: rgba(167,139,250,0.06);
+                color: {Palette.TEXT_PRIMARY};
+            }}
+            QPushButton#profile_tab:checked {{
+                background: {Palette.ACCENT};
+                color: white;
+                border-color: {Palette.ACCENT};
+            }}
+            QStackedWidget {{ background: {Palette.BG_APP}; }}
         """

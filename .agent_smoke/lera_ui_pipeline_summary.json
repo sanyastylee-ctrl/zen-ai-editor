@@ -1,0 +1,161 @@
+{
+  "model": "Mistral-Nemo-12B-ArliAI-RPMax-v1.2.Q5_K_M.gguf",
+  "turns": 65,
+  "valid_turns": 65,
+  "all_passed": true,
+  "failures": [],
+  "short": [
+    {
+      "phase": "short",
+      "user": "Привет",
+      "response": "Алло, Саша! Как дела?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.095,
+      "replay": false
+    },
+    {
+      "phase": "short",
+      "user": "Тут?",
+      "response": "Угу, я тут. Всё путем у меня! А что там?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.2,
+      "replay": false
+    },
+    {
+      "phase": "short",
+      "user": "Скажи новую фразу про кофе.",
+      "response": "Кофе — это волшебство, заключенное в чашке.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.143,
+      "replay": false
+    },
+    {
+      "phase": "short",
+      "user": "А теперь совсем другую про дождь.",
+      "response": "Дождь — это слезы неба.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.227,
+      "replay": false
+    },
+    {
+      "phase": "short",
+      "user": "Что ты сейчас делаешь?",
+      "response": "Сижу дома, смотрю сериал. А ты?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.341,
+      "replay": false
+    }
+  ],
+  "long_tail": [
+    {
+      "phase": "long",
+      "user": "ui-msg-051: Тут?",
+      "response": "ui-msg-051: Я тут, Саша. Чем могу быть полезен для тебя?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.423,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-052: Продолжай",
+      "response": "ui-msg-052: Продолжать что, Саша? Уточний, пожалуйста.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.576,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-053: Что думаешь?",
+      "response": "ui-msg-053: О чём, Саша? Какой вопрос тебя волнует больше всего в данный момент?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.35,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-054: Коротко ответь про музыку",
+      "response": "ui-msg-054: Музыка - это душа, в которой живет эмоция.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.4,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-055: Теперь про тёплый свет",
+      "response": "ui-msg-055: Тёплый свет - это объятие солнца.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.59,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-056: Маркер диалога",
+      "response": "ui-msg-056: Маркер диалога - это значок, который ты можешь использовать для обозначения того, что твой партнёр в беседе должен прочитать следующее сообщение.",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.28,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-057: Привет",
+      "response": "ui-msg-057: Привет, Саша! Как дела?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.718,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-058: Тут?",
+      "response": "ui-msg-058: Я тут, Саша. Как я могу быть тебе полезен?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.44,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-059: Продолжай",
+      "response": "ui-msg-059: Продолжать что, Саша? Что ты хочешь услышать от меня в первую очередь?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.395,
+      "replay": false
+    },
+    {
+      "phase": "long",
+      "user": "ui-msg-060: Что думаешь?",
+      "response": "ui-msg-060: О чём, Саша? Какой вопрос тебя волнует больше всего в данный момент?",
+      "saved": true,
+      "valid": true,
+      "echo": false,
+      "echo_similarity": 0.35,
+      "replay": false
+    }
+  ]
+}

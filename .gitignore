@@ -36,3 +36,50 @@ zen_comfyui_*.png
 # Системные файлы
 .DS_Store
 Thumbs.db
+
+# Build / release artifacts
+build/
+dist/
+*.zip
+*.7z
+*.rar
+*.exe
+*.dll
+*.pyd
+*.pyz
+*.pkg
+*.toc
+
+# PyInstaller
+*.spec.bak
+
+# Smoke / temp artifacts
+.agent_smoke/
+*.log
+logs/
+temp/
+tmp/
+
+# Local app/runtime data
+sessions/
+memory/
+settings/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Models / large local assets
+models/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx

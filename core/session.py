@@ -1,9 +1,11 @@
 import os
-import json
 import re
+from pathlib import Path
 
-_RECOVERY_DIR  = os.path.join(os.getcwd(), '.zen_ai', 'recovery')
-_SESSION_FILE  = os.path.join(os.getcwd(), '.zen_ai', 'session.json')
+from .app_data import SESSIONS_DIR, atomic_write_json, read_json
+
+_RECOVERY_DIR = str(SESSIONS_DIR / "recovery")
+_SESSION_FILE = str(SESSIONS_DIR / "editor_session.json")
 
 class SessionManager:
     @staticmethod
@@ -29,21 +31,14 @@ class SessionManager:
                 'tabs':        tabs_info,
                 'current_tab': editor_tabs.currentIndex(),
             }
-            os.makedirs(os.path.dirname(_SESSION_FILE), exist_ok=True)
-            with open(_SESSION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(session, f, ensure_ascii=False, indent=2)
+            atomic_write_json(Path(_SESSION_FILE), session)
         except Exception:
             pass
 
     @staticmethod
     def load() -> dict | None:
-        try:
-            if os.path.exists(_SESSION_FILE):
-                with open(_SESSION_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return None
+        data = read_json(Path(_SESSION_FILE), None)
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def clear():
