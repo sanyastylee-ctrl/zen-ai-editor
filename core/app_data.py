@@ -23,8 +23,9 @@ SESSIONS_DIR = APP_DIR / "sessions"
 MEMORY_DIR = APP_DIR / "memory"
 SETTINGS_DIR = APP_DIR / "settings"
 LOGS_DIR = APP_DIR / "logs"
+AGENT_RUNS_DIR = APP_DIR / "agent_runs"
 
-for _directory in (APP_DIR, CHATS_DIR, SESSIONS_DIR, MEMORY_DIR, SETTINGS_DIR, LOGS_DIR):
+for _directory in (APP_DIR, CHATS_DIR, SESSIONS_DIR, MEMORY_DIR, SETTINGS_DIR, LOGS_DIR, AGENT_RUNS_DIR):
     try:
         _directory.mkdir(parents=True, exist_ok=True)
     except OSError:

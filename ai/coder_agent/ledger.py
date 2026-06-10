@@ -5,7 +5,7 @@ from dataclasses import asdict
 from core.tools import ToolCall, ToolResult
 
 from .state import TaskLedgerItem, TaskStatus, TaskType
-from .verification import CommandGoal
+from .verification import CommandGoal, normalize_command
 
 
 class TaskLedger:
@@ -78,6 +78,14 @@ class TaskLedger:
                 if evidence:
                     item.evidence.append(evidence)
 
+    def mark_all_repairs_done(self, evidence: str = "") -> None:
+        for item in self.items:
+            if item.type == TaskType.FIX:
+                item.status = TaskStatus.DONE
+                item.failure_reason = ""
+                if evidence:
+                    item.evidence.append(evidence)
+
     def record_tool_result(self, call: ToolCall, result: ToolResult, matched_command_goal: str = "") -> None:
         if not result.ok or result.meta.get("duplicate"):
             return
@@ -116,7 +124,7 @@ class TaskLedger:
 
     def _mark_command_done(self, command: str, evidence: str) -> None:
         for item in self.items:
-            if item.type == TaskType.RUN_COMMAND and item.command == command:
+            if item.type == TaskType.RUN_COMMAND and normalize_command(item.command) == normalize_command(command):
                 item.status = TaskStatus.DONE
                 item.evidence.append(evidence)
 

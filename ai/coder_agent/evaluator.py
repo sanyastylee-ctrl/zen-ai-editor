@@ -85,6 +85,21 @@ def evaluate_final_readiness(
     if pending_file_goals:
         blockers.append("pending file goals: " + ", ".join(pending_file_goals[:5]))
 
+    dependency_goals = list(getattr(state, "dependency_goals", []) or [])
+    if dependency_goals:
+        if not getattr(state, "dependency_install_done", False):
+            blockers.append(
+                "pending dependency install: "
+                + ", ".join(dependency_goals[:5])
+            )
+        if not getattr(state, "import_verification_done", False):
+            blockers.append(
+                "pending dependency import verification: "
+                + ", ".join(dependency_goals[:5])
+            )
+    if getattr(state, "app_run_required", False) and not getattr(state, "app_run_done", False):
+        blockers.append("pending application run verification")
+
     allowed = not blockers
     if allowed:
         summary = "all ledger items and required command goals are verified"

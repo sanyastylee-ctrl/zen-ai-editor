@@ -85,6 +85,9 @@ class CoderAgentController:
                 ),
             )
 
+        if tool in COMMAND_TOOLS and facts.get("dependency_workflow_active"):
+            return GuardDecision(False)
+
         duplicate = self._duplicate_done_command(call, facts)
         if duplicate.blocked:
             return duplicate

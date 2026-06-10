@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import os
 import re
 import sys
@@ -43,7 +44,7 @@ from ai.agent import AgentWorker, sanitize_agent_history
 from ai.research import ResearchWorker
 from ai.vision import VisionWorker
 from ai.worker import InferenceWorker
-from core.research import needs_web_search
+from core.research import clean_user_visible_text, public_failure_message, needs_web_search
 from ui.chat import ChatView
 from ui.chat.styles import Palette
 from ui.agent_progress import AgentProgressOverlay
@@ -702,21 +703,25 @@ class ZenEditor(QMainWindow):
         layout.setSpacing(6)
 
         title_row = QHBoxLayout()
-        title = QLabel(str(source.get("title") or source.get("url") or "Источник"))
+        title = QLabel(clean_user_visible_text(str(source.get("title") or source.get("url") or "Источник"), max_chars=180))
         title.setObjectName("sourceTitle")
         title.setWordWrap(True)
         title_row.addWidget(title, 1)
 
-        status = str(source.get("status") or "")
+        status = str(source.get("display_status") or source.get("status") or "")
+        status_label = str(source.get("status_label") or "")
         read_ok = bool(source.get("read_ok"))
         if read_ok:
-            status_text = "read"
+            status_text = status_label or "read"
             status_kind = "read"
-        elif status == "failed":
-            status_text = "failed"
+        elif status in {"js_bootstrap", "not_human_readable", "noisy", "not_readable"}:
+            status_text = status_label or "not readable"
+            status_kind = "failed"
+        elif status in {"failed", "timeout", "empty_page", "binary_content", "encoding", "skipped_private_url", "private_or_local_url", "non_http_url"}:
+            status_text = status_label or "failed"
             status_kind = "failed"
         else:
-            status_text = "snippet only"
+            status_text = status_label or "snippet only"
             status_kind = "snippet"
         badge = QLabel(status_text)
         badge.setObjectName("sourceStatus")
@@ -725,13 +730,21 @@ class ZenEditor(QMainWindow):
         layout.addLayout(title_row)
 
         url = str(source.get("url") or "")
-        domain = str(source.get("domain") or url)
+        domain = clean_user_visible_text(str(source.get("domain") or url), max_chars=140)
         meta = QLabel(domain)
         meta.setObjectName("sourceMeta")
         meta.setWordWrap(True)
         layout.addWidget(meta)
 
-        excerpt = str(source.get("excerpt") or source.get("snippet") or source.get("failure_reason") or "").strip()
+        if source.get("display_message"):
+            excerpt = clean_user_visible_text(str(source.get("display_message")), max_chars=700)
+        elif status in {"js_bootstrap", "not_human_readable", "noisy", "not_readable"}:
+            excerpt = public_failure_message("js_bootstrap" if status == "js_bootstrap" else "not_human_readable")
+        elif status == "failed":
+            excerpt = public_failure_message("failed", str(source.get("failure_reason") or ""))
+        else:
+            excerpt = str(source.get("excerpt") or source.get("snippet") or source.get("failure_reason") or "").strip()
+            excerpt = clean_user_visible_text(excerpt, max_chars=700)
         if excerpt:
             body = QLabel(excerpt[:700] + ("..." if len(excerpt) > 700 else ""))
             body.setObjectName("sourceExcerpt")
@@ -1493,11 +1506,20 @@ class ZenEditor(QMainWindow):
         self.worker.status.connect(lambda msg: self.model_status.setText(msg))
 
     def _research_requires_pipeline(self, profile: AIProfile, text: str) -> bool:
+        """Для RESEARCHER — всегда True.
+
+        Ранее возвращал False если classify_query не дал fresh/compare, и тогда
+        запрос уходил в InferenceWorker, который отвечал «я локальная модель».
+        Теперь: любой запрос на RESEARCHER-профиле идёт через ResearchPipeline.
+        Pipeline сам решит — нужен поиск или нет. Если не нужен — честный ответ
+        без «ищи сам».
+        """
         if profile.kind != ProfileKind.RESEARCHER:
             return False
-        if not getattr(profile, "require_sources_for_fresh_info", True):
-            return False
-        return needs_web_search(text, require_sources_for_fresh_info=True)
+        from core.diagnostics import write_log
+        digest = hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+        write_log(f'[searcher_route_research] chars="{len(text or "")}" hash="{digest}"')
+        return True
 
     def _should_run_vision_assist(self, profile: AIProfile, image_paths: list[str]) -> bool:
         if profile.kind != ProfileKind.CODER:

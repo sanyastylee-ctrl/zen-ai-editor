@@ -8,11 +8,13 @@ with a small XML dialect in plain text and parsed after each model turn.
 from __future__ import annotations
 
 import html
+import ast
 import importlib.util
 import json
 import os
 import re
 import shlex
+import sys
 import threading
 import time
 import uuid
@@ -27,10 +29,13 @@ from core.paths import resolve_model_path
 from core.profiles import AIProfile, ChatTemplate
 from core.token_budget import TokenBudget
 from core.tools import ToolCall, ToolResult, default_tools
+from core.tools.term import RunTerminalTool
 from ai.coder_agent import (
     AgentRunStateV3,
+    AgentRunCheckpoint,
     CoderAgentController,
     CommandGoal,
+    FileGoal,
     TaskLedger,
     TaskStatus,
     TaskType,
@@ -43,6 +48,8 @@ from ai.coder_agent import (
     FileGoalStatus,
     normalize_command as normalize_v3_command,
     parse_traceback,
+    mark_checkpoint_done,
+    save_checkpoint,
     serialize_file_goals,
     verify_file_goal,
 )
@@ -131,6 +138,20 @@ CLARIFICATION_RE = re.compile(
     r"что\s+именно.{0,40}(сделать|изменить|добавить)|"
     r"what\s+exactly|please\s+(describe|clarify|specify)",
     re.IGNORECASE | re.DOTALL,
+)
+PROSE_FILE_INTENTION_RE = re.compile(
+    r"(?i)("
+    r"(?:давайте|теперь|сейчас|я|мы|нужно|надо|будем|затем|потом)\s+"
+    r"(?:создадим|создам|создать|создаю|напишем|напишу|добавим|добавлю|сделаем|сделаю)"
+    r"|(?:create|write|add|make)\s+(?:the\s+)?(?:file\s+)?"
+    r")"
+)
+GENERIC_ROOT_FILES_RE = re.compile(
+    r"(?i)("
+    r"сам\s+создай.{0,80}(?:необходим|нужн).{0,40}файл|"
+    r"создай.{0,80}(?:необходим|нужн).{0,40}файл|"
+    r"create.{0,80}(?:necessary|required|needed).{0,40}files?"
+    r")"
 )
 FOLLOWUP_RE = re.compile(
     r"^\s*(давай|ок|окей|делай|реализовывай|продолжай|дальше|продолжи(?:\s+работу)?|continue|go ahead)\s*[.!?]*\s*$|"
@@ -504,13 +525,25 @@ class AgentWorker(QThread):
             self._incoming_continuation_state.get("successful_tool_keys", [])
             if self._incoming_continuation_state else []
         )
+        self._failed_tool_keys: set[str] = set(
+            self._incoming_continuation_state.get("failed_tool_keys", [])
+            if self._incoming_continuation_state else []
+        )
         summary = (
             self._incoming_continuation_state.get("summary", {})
             if self._incoming_continuation_state else {}
         )
         if not isinstance(summary, dict):
             summary = {}
-        self._run_id = uuid.uuid4().hex[:12]
+        incoming_run_id = str(
+            self._incoming_continuation_state.get("run_id", "")
+            if self._incoming_continuation_state else ""
+        )
+        self._run_id = incoming_run_id or uuid.uuid4().hex[:12]
+        self._session_id = str(
+            self._incoming_continuation_state.get("session_id", "")
+            if self._incoming_continuation_state else ""
+        )
         self._previous_assistant_text = self._last_assistant_text()
         self._last_actionable_user_task = self._find_last_actionable_user_task()
         self.resolved_task = self._resolve_task(summary)
@@ -553,6 +586,8 @@ class AgentWorker(QThread):
             self._file_goals = extract_file_goals(
                 self._file_goal_source_text()
             )
+        if not self._file_goals:
+            self._file_goals = self._default_file_goals_for_generic_create()
         self._active_repair: dict = dict(
             summary.get("active_repair", {})
             if isinstance(summary.get("active_repair"), dict)
@@ -562,6 +597,7 @@ class AgentWorker(QThread):
         self._repair_touched_relevant = bool(self._active_repair.get("touched_relevant", False))
         self._repair_failures_after_touch = int(self._active_repair.get("failures_after_touch", 0) or 0)
         self._repair_completed_this_run = False
+        self._runtime_repair_forced_attempts = int(summary.get("runtime_repair_forced_attempts", 0) or 0)
         if self._command_goals:
             self._requires_command_success = True
         self._tool_required_retries = 0
@@ -572,6 +608,31 @@ class AgentWorker(QThread):
         self._same_file_reads: dict[tuple[int, str], int] = {}
         self._tool_sequence_counts: dict[tuple[int, str], int] = {}
         self._clarification_retries = 0
+        self._prose_file_intent_retries: dict[str, int] = {}
+        self._multi_file_warning_emitted = False
+        self._python_cmd = str(summary.get("python_cmd") or self._default_python_cmd())
+        self._pip_install_cmd = str(summary.get("pip_install_cmd") or "")
+        self._dependency_goals: list[str] = list(
+            summary.get("dependency_goals", [])
+            if isinstance(summary.get("dependency_goals"), list)
+            else []
+        )
+        self._dependency_install_done = bool(summary.get("dependency_install_done", False))
+        self._dependency_install_evidence: list[str] = list(
+            summary.get("dependency_install_evidence", [])
+            if isinstance(summary.get("dependency_install_evidence"), list)
+            else []
+        )
+        self._import_verification_done = bool(summary.get("import_verification_done", False))
+        self._app_run_required = bool(summary.get("app_run_required", False))
+        self._app_run_done = bool(summary.get("app_run_done", False))
+        self._app_run_evidence: list[str] = list(
+            summary.get("app_run_evidence", [])
+            if isinstance(summary.get("app_run_evidence"), list)
+            else []
+        )
+        self._dependency_workflow_attempts = int(summary.get("dependency_workflow_attempts", 0) or 0)
+        self._dependency_workflow_active = False
         self._read_transcript_chars = 0
         self._action_tool_succeeded = any(item.get("ok") for item in self._tool_history)
         self._mutating_tool_succeeded = self._has_prior_success(mutating=True)
@@ -607,6 +668,15 @@ class AgentWorker(QThread):
             file_goals=list(self._file_goals),
             command_goals=list(self._command_goals),
             command_goals_done=sorted(self._command_goals_done),
+            python_cmd=self._python_cmd,
+            pip_install_cmd=self._pip_install_cmd,
+            dependency_goals=list(self._dependency_goals),
+            dependency_install_done=self._dependency_install_done,
+            dependency_install_evidence=list(self._dependency_install_evidence),
+            import_verification_done=self._import_verification_done,
+            app_run_required=self._app_run_required,
+            app_run_done=self._app_run_done,
+            app_run_evidence=list(self._app_run_evidence),
             visual_context=self.visual_context,
         )
         self._ledger = TaskLedger.from_command_goals(self._command_goal_specs)
@@ -750,6 +820,13 @@ class AgentWorker(QThread):
 
                 if not calls:
                     if parser_errors:
+                        if self._recover_runtime_repair_action(
+                            response,
+                            transcript,
+                            reason="malformed tool block during runtime repair",
+                            parser_errors=True,
+                        ):
+                            continue
                         transcript.append(
                             "System corrective instruction:\n"
                             "The previous tool call was malformed. Do not repeat it. "
@@ -766,6 +843,16 @@ class AgentWorker(QThread):
                                 partial_response=response,
                             )
                             break
+                        continue
+                    if self._recover_prose_file_intention(response, transcript):
+                        self._tool_required_retries = 0
+                        continue
+                    if self._recover_runtime_repair_action(
+                        response,
+                        transcript,
+                        reason="prose-only response during runtime repair",
+                    ):
+                        self._tool_required_retries = 0
                         continue
                     fallback_call = self._fallback_run_terminal_call()
                     if fallback_call is not None:
@@ -812,6 +899,14 @@ class AgentWorker(QThread):
                             "\n[Агент ещё не выполнил требуемое действие через tools. Продолжаю.]\n"
                         )
                         continue
+                    if self._maybe_run_dependency_workflow(transcript):
+                        self._tool_required_retries = 0
+                        self._auto_run_command_goals_after_dependency_workflow(transcript)
+                        if self._maybe_finalize_after_verified_goals():
+                            break
+                        if self._maybe_finalize_after_controller_workflow():
+                            break
+                        continue
                     final_evaluation = self._final_evaluation()
                     if not final_evaluation.allowed:
                         if self._tool_required_retries >= MAX_TOOL_REQUIRED_RETRIES:
@@ -853,6 +948,7 @@ class AgentWorker(QThread):
                     self._log_agent_event("finished", stop_reason="completed", resolved_task=self.resolved_task)
                     snapshot = self._emit_progress("finished")
                     self.agent_finished.emit(snapshot)
+                    mark_checkpoint_done(self._run_id)
                     break
 
                 self._emit_visible_response(visible)
@@ -1002,6 +1098,14 @@ class AgentWorker(QThread):
                         )
                         self._save_continuation_state("3 критические ошибки tool подряд", transcript)
                         return
+                if self._maybe_run_dependency_workflow(transcript):
+                    turn_made_progress = True
+                    self._auto_run_command_goals_after_dependency_workflow(transcript)
+                    if self._maybe_finalize_after_verified_goals():
+                        break
+                    if self._maybe_finalize_after_controller_workflow():
+                        break
+                    continue
                 if self._maybe_finalize_after_verified_goals():
                     break
                 if duplicate_batch_interrupted and not turn_made_progress:
@@ -1018,11 +1122,12 @@ class AgentWorker(QThread):
             self.finished_signal.emit()
 
     def _initial_transcript(self) -> list[str]:
-        if self._incoming_continuation_state and self.is_continue_request(self.user_message):
+        if self._incoming_continuation_state:
             summary = self._incoming_continuation_state.get("summary", {})
             if isinstance(summary, dict):
                 items = [
                     "Continue from the saved state.",
+                    "Continue this Coder run from the saved checkpoint. Do not restart.",
                     f"Current resolved user task:\n{self.resolved_task or summary.get('task', self.user_message)}",
                     f"Latest user instruction:\n{self.current_user_task}",
                     f"Access mode:\n{self.access_mode}",
@@ -1035,6 +1140,15 @@ class AgentWorker(QThread):
                     "Errors:\n" + "\n".join(summary.get("errors", []) or ["(none)"]),
                     f"Next step:\n{summary.get('next_step', 'Continue carefully without repeating successful tool calls.')}",
                 ]
+                dependency_context = []
+                if summary.get("dependency_goals"):
+                    dependency_context.append("Dependency goals: " + ", ".join(summary.get("dependency_goals", [])))
+                    dependency_context.append(f"Dependency install done: {bool(summary.get('dependency_install_done'))}")
+                    dependency_context.append(f"Import verification done: {bool(summary.get('import_verification_done'))}")
+                    dependency_context.append(f"App run done: {bool(summary.get('app_run_done'))}")
+                    dependency_context.append(f"Python/interpreter: {summary.get('python_cmd', '')}")
+                if dependency_context:
+                    items.append("Dependency state:\n" + "\n".join(dependency_context))
                 if self._command_goals:
                     items.append(
                         "Required terminal verification goals:\n"
@@ -1051,6 +1165,14 @@ class AgentWorker(QThread):
                     "CRITICAL: do NOT restate or summarize the plan in plain text. "
                     "Emit a tool call IMMEDIATELY as your first action. "
                     "If all files are done, emit a concise final summary and stop."
+                )
+                write_log(
+                    f"[agent_resume_prompt_built] run_id={self._run_id} "
+                    f"next={json.dumps(str(summary.get('next_step', '')), ensure_ascii=False)}"
+                )
+                write_log(
+                    f"[agent_resume_next_action] run_id={self._run_id} "
+                    f"next={json.dumps(str(summary.get('next_step', '')), ensure_ascii=False)}"
                 )
                 return items
 
@@ -1125,6 +1247,8 @@ class AgentWorker(QThread):
     def _resolve_task(self, summary: dict) -> str:
         current = self.current_user_task
         summary_task = str(summary.get("task") or summary.get("current_user_task") or "").strip()
+        if self._incoming_continuation_state and summary_task:
+            return summary_task
         if self._is_followup_message():
             if summary_task:
                 return summary_task
@@ -1314,6 +1438,12 @@ class AgentWorker(QThread):
             return goal + " 1"
         return goal
 
+    def _command_goal_execution_command(self, goal: str) -> str:
+        command = self._command_goal_example(goal)
+        if re.match(r"(?i)^python\s+main\.py(?:\s|$)", command):
+            return self._python_cmd + " " + re.sub(r"(?i)^python\s+", "", command, count=1)
+        return command
+
     def _pending_command_goal_text(self) -> str:
         pending = [
             self._command_goal_example(goal)
@@ -1326,6 +1456,14 @@ class AgentWorker(QThread):
         command = str(call.args.get("command", ""))
         matched_goal = self._command_goal_for_command(command) if self._command_goals else ""
         traceback_info = parse_traceback(result.output, self.project_root)
+        if (
+            not matched_goal
+            and not result.ok
+            and self._looks_like_json_decode_runtime_error(result.output)
+            and self._is_direct_python_file_run(command)
+            and (self._user_asked_to_run() or self._dependency_workflow_active)
+        ):
+            matched_goal = self._ensure_runtime_command_goal(command, "runtime_json_decode")
         if (
             not matched_goal
             and not result.ok
@@ -1366,6 +1504,7 @@ class AgentWorker(QThread):
         if matched_goal:
             self._command_goals_done.add(matched_goal)
             self.run_state_v3.command_goals_done = sorted(self._command_goals_done)
+            self._sync_done_command_goals_to_ledger("command goal verified")
             self._log_agent_event(
                 "command_goal_done",
                 command=command,
@@ -1551,6 +1690,8 @@ class AgentWorker(QThread):
 
     def _infer_command_failure_type(self, output: str) -> str:
         lower = (output or "").lower()
+        if self._looks_like_json_decode_runtime_error(output):
+            return "handle_non_json_response"
         if "traceback (most recent call last)" in lower:
             return "traceback_error"
         if "state_not_persisted" in lower:
@@ -1574,15 +1715,23 @@ class AgentWorker(QThread):
         traceback_info = parse_traceback(output, self.project_root)
         failure_type = self._infer_command_failure_type(failure + "\n" + output)
         target_files: list[str] = list(traceback_info.relevant_files) if traceback_info else []
-        if "state_not_persisted" in failure:
+        if failure_type == "handle_non_json_response":
+            repair_id = "repair-runtime-json"
+            target_files = ["main.py"]
+        elif "state_not_persisted" in failure:
             failure_type = "state_not_persisted"
+            repair_id = "repair-cli-command-goals"
         elif "missing_file_side_effect" in failure:
             failure_type = "missing_file_side_effect"
+            repair_id = "repair-cli-command-goals"
         elif "missing_expected_stdout" in failure:
             failure_type = "missing_expected_stdout"
+            repair_id = "repair-cli-command-goals"
         elif traceback_info:
             failure_type = "traceback_error"
-        repair_id = "repair-traceback" if traceback_info else "repair-cli-command-goals"
+            repair_id = "repair-traceback"
+        else:
+            repair_id = "repair-cli-command-goals"
         if self._active_repair.get("id") == repair_id:
             if self._repair_touched_relevant or self._repair_failures_after_touch:
                 self._repair_failures_after_touch += 1
@@ -1600,11 +1749,17 @@ class AgentWorker(QThread):
             "actual_output": self._compact_state_text(output, limit=900),
             "description": f"Fix {failure_type} for {command}",
             "evidence": (
+                "JSONDecodeError/response.json failed; inspect main.py, handle non-JSON HTTP responses, "
+                "then rerun main.py with exit 0"
+                if failure_type == "handle_non_json_response"
+                else
                 traceback_info.summary() + "; rerun must exit 0, replacing one exception with another is still failed"
                 if traceback_info
                 else self._compact_state_text(failure, limit=500)
             ),
             "target_files": target_files,
+            "repair_type": failure_type,
+            "next_required_action": "read_file main.py" if failure_type == "handle_non_json_response" else "",
             "touched_relevant": self._repair_touched_relevant,
             "attempts": self._repair_attempts,
             "failures_after_touch": self._repair_failures_after_touch,
@@ -1654,6 +1809,8 @@ class AgentWorker(QThread):
         repair_id = str(self._active_repair.get("id") or "")
         if repair_id:
             self._ledger.mark_repair_done(repair_id, evidence)
+            self._ledger.mark_all_repairs_done(evidence)
+            self._sync_done_command_goals_to_ledger("repair verified")
             self._log_agent_event("repair", action="completed", evidence=evidence)
             write_log(
                 f"[coder_repair] run_id={self._run_id} action=\"completed\" "
@@ -1664,6 +1821,14 @@ class AgentWorker(QThread):
         self._repair_touched_relevant = False
         self._repair_failures_after_touch = 0
         self._repair_completed_this_run = True
+
+    def _sync_done_command_goals_to_ledger(self, evidence: str) -> None:
+        for done_goal in sorted(self._command_goals_done):
+            for item in self._ledger.items:
+                if item.type == TaskType.RUN_COMMAND and self._normalize_command_goal(item.command) == self._normalize_command_goal(done_goal):
+                    item.status = TaskStatus.DONE
+                    if evidence:
+                        item.evidence.append(evidence)
 
     def _rollback_todo_cli_goals(self) -> None:
         for goal in list(self._command_goals_done):
@@ -1749,6 +1914,193 @@ class AgentWorker(QThread):
         matched_goal = self._command_goal_for_command(command)
         return bool(matched_goal and matched_goal not in self._command_goals_done)
 
+    def _allow_failed_tool_repeat(self, tool, call: ToolCall) -> bool:
+        if getattr(tool, "runs_command", False):
+            command = str(call.args.get("command", ""))
+            if self._active_repair:
+                return bool(self._repair_touched_relevant and self._command_goal_for_command(command))
+            return False
+        if getattr(tool, "mutates_project", False):
+            return False
+        return False
+
+    def _normalize_repair_full_file_edit(self, call: ToolCall, canonical: str) -> ToolCall:
+        if canonical != "edit_file" or not self._active_repair:
+            return call
+        path = self._safe_rel_path(call.args.get("path", ""), allow_missing=True)
+        if not path:
+            return call
+        targets = {
+            str(item or "").replace("\\", "/")
+            for item in (self._active_repair.get("target_files") or [])
+            if str(item or "").strip()
+        }
+        if targets and path.replace("\\", "/") not in targets:
+            return call
+        old_str = call.args.get("old_str", "")
+        new_str = call.args.get("new_str", "")
+        if str(old_str or "").strip() or not isinstance(new_str, str) or not new_str.strip():
+            return call
+        absolute = os.path.join(self.project_root, path)
+        if path not in self._read_files or not os.path.isfile(absolute):
+            return call
+        try:
+            with open(absolute, "r", encoding="utf-8", errors="ignore") as f:
+                old_text = f.read()
+        except OSError:
+            return call
+        if not old_text or len(old_text) > 8000:
+            return call
+        args = dict(call.args)
+        args["old_str"] = old_text
+        normalized = ToolCall(name=call.name, args=args, raw=call.raw)
+        normalized.id = call.id
+        self._log_agent_event(
+            "guard_triggered",
+            guard="repair_full_file_edit_normalized",
+            path=path,
+            old_chars=len(old_text),
+            new_chars=len(new_str),
+        )
+        write_log(
+            f"[coder_guard_triggered] run_id={self._run_id} "
+            f"guard=\"repair_full_file_edit_normalized\" path={json.dumps(path)}"
+        )
+        return normalized
+
+    def _runtime_json_repair_active(self) -> bool:
+        if not self._active_repair:
+            return False
+        value = str(
+            self._active_repair.get("repair_type")
+            or self._active_repair.get("failure_type")
+            or ""
+        )
+        return value == "handle_non_json_response"
+
+    def _runtime_repair_target_file(self) -> str:
+        targets = self._active_repair.get("target_files") or []
+        if isinstance(targets, list):
+            for target in targets:
+                text = str(target or "").replace("\\", "/")
+                if text.lower() == "main.py":
+                    return "main.py"
+            for target in targets:
+                text = str(target or "").replace("\\", "/")
+                if text.endswith(".py") and not os.path.isabs(text):
+                    return text
+        return "main.py"
+
+    def _runtime_repair_command(self) -> str:
+        command = str(self._active_repair.get("failed_command") or "").strip()
+        return command or self._app_run_command()
+
+    def _runtime_repair_corrective(self) -> str:
+        target = self._runtime_repair_target_file()
+        if target not in self._read_files:
+            return (
+                f"You must call exactly one tool: read_file {target}. "
+                "Do not answer in prose. Do not explain. Do not emit empty XML."
+            )
+        if not self._repair_touched_relevant:
+            return (
+                f"You must patch {target} to handle non-JSON HTTP responses safely. "
+                "Use exactly one edit_file/apply_patch tool. Handle response.raise_for_status(), "
+                "requests.RequestException, and ValueError around response.json()."
+            )
+        return (
+            f"You must rerun exactly one command now: {self._runtime_repair_command()}. "
+            "Do not answer in prose before rerun evidence."
+        )
+
+    def _forced_runtime_repair_call(self) -> ToolCall | None:
+        target = self._runtime_repair_target_file()
+        if target not in self._read_files:
+            return ToolCall(
+                name="read_file",
+                args={"path": target},
+                raw=f"<tool name=\"read_file\"><path>{target}</path></tool>",
+            )
+        if not self._repair_touched_relevant:
+            return self._build_non_json_response_patch_call(target)
+        command = self._runtime_repair_command()
+        if command:
+            return ToolCall(
+                name="run_terminal",
+                args={"command": command, "timeout": "120"},
+                raw=f"<tool name=\"run_terminal\"><command>{command}</command></tool>",
+            )
+        return None
+
+    def _recover_runtime_repair_action(
+        self,
+        response: str,
+        transcript: list[str],
+        *,
+        reason: str,
+        parser_errors: bool = False,
+    ) -> bool:
+        if not self._runtime_json_repair_active():
+            return False
+        self._runtime_repair_forced_attempts += 1
+        transcript.append(
+            "Runtime repair response rejected:\n"
+            f"reason={reason}\n"
+            f"response={self._compact_state_text(response, limit=500)}"
+        )
+        self._log_agent_event(
+            "guard_triggered",
+            guard="runtime_repair_requires_tool",
+            reason=reason,
+            attempts=self._runtime_repair_forced_attempts,
+            active_repair=dict(self._active_repair),
+        )
+        if parser_errors and self._runtime_repair_forced_attempts == 1:
+            corrective = self._runtime_repair_corrective()
+            transcript.append("System corrective instruction:\n" + corrective)
+            self.chunk_received.emit(
+                "\n[Агент вернул некорректный tool block во время ремонта. "
+                "Требую ровно один repair tool call.]\n"
+            )
+            write_log(
+                f"[coder_repair] run_id={self._run_id} action=\"forced corrective\" "
+                f"reason={json.dumps(reason)}"
+            )
+            return True
+        call = self._forced_runtime_repair_call()
+        if call is None:
+            transcript.append(
+                "Runtime repair blocker:\n"
+                "Controller could not derive the next repair tool call."
+            )
+            return False
+        result = self._execute_tool(call)
+        self._tool_calls_used += 1
+        transcript.append(
+            f"Forced runtime repair result for {call.name}:\n"
+            f"{self._tool_output_for_transcript(call, result)}"
+        )
+        tool = self._tools.get(call.name)
+        if result.ok and tool is not None and tool.mutates_project:
+            verification = self._verify_after_change(call)
+            if verification is not None:
+                transcript.append(
+                    f"Verification result for {verification['name']}:\n"
+                    f"{self._tool_output_for_transcript(verification['call'], verification['result'])}"
+                )
+            compile_result = self._run_auto_compile_after_change(call)
+            if compile_result is not None:
+                transcript.append(f"Automatic compile result:\n{compile_result.output}")
+            repair_rerun = self._auto_rerun_repair_sequence()
+            if repair_rerun:
+                transcript.extend(repair_rerun)
+        if not result.ok:
+            transcript.append(
+                "System corrective instruction:\n"
+                + self._runtime_repair_corrective()
+            )
+        return True
+
     def _maybe_finalize_after_verified_goals(self) -> bool:
         if not self._command_goals or not self._all_command_goals_done():
             return False
@@ -1772,6 +2124,51 @@ class AgentWorker(QThread):
         )
         snapshot = self._emit_progress("finished")
         self.agent_finished.emit(snapshot)
+        mark_checkpoint_done(self._run_id)
+        return True
+
+    def _auto_run_command_goals_after_dependency_workflow(self, transcript: list[str]) -> bool:
+        if not self._command_goals or self._all_command_goals_done():
+            return False
+        if self._dependency_goals and not (self._dependency_install_done and self._import_verification_done):
+            return False
+        verification_lines = self._auto_run_pending_command_goals()
+        if verification_lines:
+            transcript.extend(verification_lines)
+            return True
+        return False
+
+    def _maybe_finalize_after_controller_workflow(self) -> bool:
+        if not (self._dependency_goals or self._app_run_required):
+            return False
+        final_evaluation = self._final_evaluation()
+        if not final_evaluation.allowed:
+            return False
+        changed = ", ".join(sorted(self._changed_files)) or "файлы проекта"
+        checks: list[str] = []
+        if self._dependency_install_done and self._pip_install_cmd:
+            checks.append(f"- {self._pip_install_cmd}")
+        if self._import_verification_done and self._dependency_goals:
+            checks.append("- " + self._import_verify_command(list(self._dependency_goals)))
+        if self._app_run_done:
+            checks.append(f"- {self._app_run_command()}")
+        self._emit_visible_response(
+            "Готово. Я изменил/создал: "
+            f"{changed}.\n\nПроверки выполнены:\n"
+            + ("\n".join(checks) if checks else "- workflow verification")
+        )
+        self.continuation_state = None
+        self._set_phase(PHASE_FINALIZE)
+        self._log_agent_event(
+            "finished",
+            stop_reason="completed_after_controller_workflow",
+            dependency_install_done=self._dependency_install_done,
+            import_verification_done=self._import_verification_done,
+            app_run_done=self._app_run_done,
+        )
+        snapshot = self._emit_progress("finished")
+        self.agent_finished.emit(snapshot)
+        mark_checkpoint_done(self._run_id)
         return True
 
     def _final_evaluation(self):
@@ -1781,6 +2178,7 @@ class AgentWorker(QThread):
         self.run_state_v3.verified_files = self._verified_files()
         self._refresh_file_goal_statuses()
         self.run_state_v3.file_goals = list(self._file_goals)
+        self._sync_dependency_state()
         self.run_state_v3.file_states = {
             path: dict(state)
             for path, state in self._file_states.items()
@@ -1909,6 +2307,8 @@ class AgentWorker(QThread):
         partial_response: str = "",
     ) -> bool:
         self._save_continuation_state(reason, transcript, partial_response=partial_response)
+        if self._is_soft_limit_reason(reason):
+            write_log(f"[agent_soft_limit_detected] run_id={self._run_id} reason={reason!r}")
         can_continue = (
             bool(getattr(self.profile, "auto_continue_enabled", True))
             and self._is_soft_limit_reason(reason)
@@ -1926,6 +2326,7 @@ class AgentWorker(QThread):
             summary["auto_continue_count"] = self._auto_continue_count() + 1
             summary["auto_continue_reason"] = reason
             self.continuation_state["auto_continue_count"] = summary["auto_continue_count"]
+            self._save_agent_checkpoint(reason=reason, resumable=True)
         snapshot = self._emit_progress(
             "auto_continue",
             auto_continue=True,
@@ -1938,12 +2339,15 @@ class AgentWorker(QThread):
             count=snapshot.get("auto_continue_count"),
             max=snapshot.get("max_auto_continues"),
         )
+        write_log(f"[agent_auto_resume_scheduled] run_id={self._run_id} reason={reason!r} count={snapshot.get('auto_continue_count')}")
         return True
 
     def _has_pending_work_for_auto_continue(self) -> bool:
         if self._active_repair:
             return True
         if self._command_goals and not self._all_command_goals_done():
+            return True
+        if self._dependency_workflow_needed():
             return True
         if self._ledger.pending():
             return True
@@ -1959,6 +2363,11 @@ class AgentWorker(QThread):
         self.run_state_v3.blocked_reason = reason
         snapshot = self._emit_progress("blocked", blocker_reason=reason)
         self.agent_blocked.emit(snapshot)
+        manual_stop = "остановлено пользователем" in (reason or "").lower()
+        self._save_agent_checkpoint(reason=reason, resumable=manual_stop)
+        if manual_stop:
+            write_log(f"[agent_manual_stop_checkpointed] run_id={self._run_id}")
+        write_log(f"[agent_resume_blocked] run_id={self._run_id} reason={reason!r}")
 
     def _log_agent_event(self, event: str, **fields) -> None:
         values = " ".join(
@@ -1966,6 +2375,91 @@ class AgentWorker(QThread):
             for key, value in fields.items()
         )
         write_log(f"[agent_{event}] run_id={self._run_id} {values}".rstrip())
+
+    def _profile_snapshot(self) -> dict:
+        return {
+            "id": getattr(self.profile, "id", ""),
+            "name": getattr(self.profile, "name", ""),
+            "kind": getattr(getattr(self.profile, "kind", ""), "value", str(getattr(self.profile, "kind", ""))),
+            "model_file": getattr(self.profile, "model_file", ""),
+            "n_ctx": getattr(self.profile, "n_ctx", 0),
+            "max_tokens": getattr(self.profile, "max_tokens", 0),
+            "auto_continue_enabled": bool(getattr(self.profile, "auto_continue_enabled", True)),
+            "max_auto_continues_per_task": self._max_auto_continues(),
+        }
+
+    def _last_tool_action(self, *, ok: bool) -> dict:
+        for item in reversed(self._tool_history):
+            if bool(item.get("ok")) == ok:
+                args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+                return {
+                    "name": item.get("name", ""),
+                    "target": args.get("path") or args.get("command") or "",
+                    "ok": bool(item.get("ok")),
+                    "meta": dict(item.get("meta", {}) if isinstance(item.get("meta"), dict) else {}),
+                }
+        return {}
+
+    def _current_goal_id(self) -> str:
+        for item in self._ledger.items:
+            if self._enum_value(item.status) in {"todo", "doing", "failed", "blocked"}:
+                return item.id
+        goal = self._current_pending_file_goal()
+        return goal.path if goal else ""
+
+    def _build_agent_checkpoint(self, *, reason: str = "", resumable: bool = False) -> AgentRunCheckpoint:
+        self._sync_dependency_state()
+        summary = {}
+        if isinstance(self.continuation_state, dict):
+            summary = dict(self.continuation_state.get("summary", {}) or {})
+        checkpoint_state = dict(self.continuation_state or {})
+        checkpoint_state.setdefault("run_id", self._run_id)
+        checkpoint_state.setdefault("session_id", self._session_id)
+        return AgentRunCheckpoint(
+            run_id=self._run_id,
+            profile_id=str(getattr(self.profile, "id", "")),
+            session_id=self._session_id,
+            project_root=self.project_root,
+            user_task=self.resolved_task or self.current_user_task,
+            phase=str(self.run_state.current_phase),
+            stop_reason=reason or self.stop_reason or self.blocked_reason,
+            resumable=resumable,
+            auto_resume_count=self._auto_continue_count(),
+            max_auto_resume_count=self._max_auto_continues(),
+            ledger=self._ledger_snapshot(),
+            current_goal_id=self._current_goal_id(),
+            file_goals=self._file_goal_snapshot(),
+            dependency_goals=list(self._dependency_goals),
+            dependency_state={
+                "python_cmd": self._python_cmd,
+                "pip_install_cmd": self._pip_install_cmd,
+                "dependency_install_done": self._dependency_install_done,
+                "dependency_install_evidence": list(self._dependency_install_evidence[-3:]),
+                "import_verification_done": self._import_verification_done,
+                "app_run_required": self._app_run_required,
+                "app_run_done": self._app_run_done,
+                "app_run_evidence": list(self._app_run_evidence[-3:]),
+            },
+            command_goals=list(self._command_goals),
+            command_goals_done=sorted(self._command_goals_done),
+            repair=dict(self._active_repair),
+            completed_tool_hashes=sorted(self._successful_tool_keys),
+            failed_tool_hashes=sorted(self._failed_tool_keys),
+            last_successful_action=self._last_tool_action(ok=True),
+            last_failed_action=self._last_tool_action(ok=False),
+            pending_next_action=self._ledger.next_step_text() or summary.get("next_step", ""),
+            python_cmd=self._python_cmd,
+            access_mode=self.access_mode,
+            profile_snapshot=self._profile_snapshot(),
+            summary=summary,
+            continuation_state=checkpoint_state,
+        )
+
+    def _save_agent_checkpoint(self, *, reason: str = "", resumable: bool = False) -> None:
+        try:
+            save_checkpoint(self._build_agent_checkpoint(reason=reason, resumable=resumable))
+        except Exception as exc:
+            write_log(f"[agent_checkpoint_save_failed] run_id={self._run_id} error={exc}")
 
     def _set_phase(self, phase: str) -> None:
         if self.run_state.current_phase != phase:
@@ -1991,6 +2485,12 @@ class AgentWorker(QThread):
             task_ledger=self._ledger.to_summary(),
         )
         self._emit_progress("run_start")
+        self._save_agent_checkpoint(reason="run started", resumable=True)
+        if self._incoming_continuation_state:
+            write_log(
+                f"[agent_auto_resume_started] run_id={self._run_id} "
+                f"count={self._auto_continue_count()} reason={json.dumps(str((self._incoming_continuation_state or {}).get('reason', '')), ensure_ascii=False)}"
+            )
 
     def _handle_missing_task_clarification(self) -> None:
         question = "Уточните конкретную задачу: какой файл создать или изменить?"
@@ -2171,6 +2671,21 @@ class AgentWorker(QThread):
                 "distinct tool call based on current evidence, or finish with a concise summary."
             )
             return True
+        goal = self._current_pending_file_goal()
+        if goal is not None:
+            call = self._forced_file_goal_call(goal)
+            made_progress = self._execute_forced_file_goal_call(
+                call,
+                transcript,
+                reason="no-progress recovery for pending FileGoal",
+            )
+            if made_progress:
+                self._no_progress_turns = 0
+                transcript.append(
+                    "No-progress recovery succeeded:\n"
+                    f"created_or_verified={goal.path}"
+                )
+                return True
         self._stop_cycle(
             "обнаружен повторяющийся цикл без прогресса",
             transcript,
@@ -2381,6 +2896,8 @@ class AgentWorker(QThread):
 
     def _should_extract_file_goals(self) -> bool:
         text = self._file_goal_source_text().lower()
+        if self._is_run_then_repair_task_text(text):
+            return False
         if not re.search(
             r"\b(создай|создать|сделай|реализуй|добавь|измени|исправь|проект|файл|files?|create|add|implement|edit|fix)\b",
             text,
@@ -2392,6 +2909,19 @@ class AgentWorker(QThread):
         ):
             return False
         return bool(extract_file_goals(text))
+
+    @staticmethod
+    def _is_run_then_repair_task_text(text: str) -> bool:
+        value = (text or "").lower()
+        if "main.py" not in value:
+            return False
+        has_run = bool(re.search(r"\b(запусти|запуск|выполни|run|execute)\b", value))
+        has_repair = bool(re.search(r"\b(traceback|ошиб|найди ошиб|исправ|почини|repair|fix)\b", value))
+        has_create_or_feature = bool(re.search(
+            r"\b(создай|создать|добавь|добавить|реализуй|create|add|implement)\b",
+            value,
+        ))
+        return has_run and has_repair and not has_create_or_feature
 
     def _file_goal_source_text(self) -> str:
         lines: list[str] = []
@@ -2421,6 +2951,657 @@ class AgentWorker(QThread):
             if any(path in line.replace("\\", "/") for path in filtered_paths)
             or not re.search(r"[\w.-]+\.(?:py|md|txt|json|toml|yaml|yml|html|css|js|ts|tsx|jsx)", line, re.IGNORECASE)
         )
+
+    def _default_file_goals_for_generic_create(self) -> list[FileGoal]:
+        text = "\n".join([self.resolved_task, self.current_user_task, self.user_message])
+        if not (
+            self._requires_mutating_success
+            and (GENERIC_ROOT_FILES_RE.search(text or "") or self._cli_version_fetch_demo_requested())
+        ):
+            return []
+        main_purpose = (
+            "Typer CLI entrypoint with version/demo/fetch commands"
+            if self._cli_version_fetch_demo_requested()
+            else "minimal Python entrypoint"
+        )
+        goals = [
+            FileGoal(path="main.py", purpose=main_purpose),
+            FileGoal(path="requirements.txt", purpose="project dependency manifest", must_compile_if_python=False),
+        ]
+        self._log_agent_event(
+            "file_goals_created",
+            source="default_generic_root_files",
+            paths=[goal.path for goal in goals],
+        )
+        write_log(
+            f"[agent_file_goals_created] run_id={self._run_id} "
+            f"source=\"default_generic_root_files\" paths={json.dumps([goal.path for goal in goals], ensure_ascii=False)}"
+        )
+        return goals
+
+    def _current_pending_file_goal(self) -> FileGoal | None:
+        self._refresh_file_goal_statuses()
+        for goal in self._file_goals:
+            if goal.required and goal.status.value != "done":
+                return goal
+        return None
+
+    def _response_mentions_file_intention(self, response: str, goal: FileGoal | None) -> bool:
+        visible = strip_tool_blocks(response or "")
+        if not visible.strip() or not goal:
+            return False
+        lower = visible.lower()
+        if goal.path.lower() in lower and PROSE_FILE_INTENTION_RE.search(visible):
+            return True
+        mentioned_paths = {path.replace("\\", "/").lstrip("./") for path in re.findall(
+            r"(?<![\w/.-])([\w.-]+(?:[/\\][\w.-]+)*\.(?:py|md|txt|json|toml|yaml|yml|html|css|js|ts|tsx|jsx|ini|cfg))",
+            visible,
+            re.IGNORECASE,
+        )}
+        return bool(mentioned_paths and PROSE_FILE_INTENTION_RE.search(visible))
+
+    def _forced_file_goal_corrective(self, goal: FileGoal) -> str:
+        abs_path = os.path.join(self.project_root, goal.path)
+        if os.path.exists(abs_path):
+            return (
+                f"Current FileGoal is {goal.path}, and the file already exists. "
+                "Do not overwrite it blindly. Emit exactly one XML tool call now: read_file for "
+                f"{goal.path}. After the read result, patch/edit only the needed change."
+            )
+        return (
+            f"Current FileGoal is {goal.path}. The previous response was prose intention, not progress. "
+            f"You must emit exactly one XML tool call now: write_file for {goal.path}. "
+            "Do not answer with text. Do not mention other files. Do not provide markdown. "
+            "The response must start with <tool name=\"write_file\">."
+        )
+
+    @staticmethod
+    def _quote_command_arg(arg: str) -> str:
+        text = str(arg or "")
+        if not text:
+            return '""'
+        if re.search(r"\s", text):
+            return '"' + text.replace('"', '\\"') + '"'
+        return text
+
+    def _default_python_cmd(self) -> str:
+        executable = sys.executable or "python"
+        if executable and os.path.exists(executable):
+            return self._quote_command_arg(executable)
+        return "python"
+
+    def _dependency_demo_requested(self) -> bool:
+        text = "\n".join([self.user_message, self.current_user_task, self.resolved_task]).lower()
+        return (
+            ("requests" in text or "request" in text or "httpbin" in text)
+            and ("rich" in text or "красив" in text or "pretty" in text or "formatted" in text)
+        )
+
+    def _cli_version_fetch_demo_requested(self) -> bool:
+        text = "\n".join([self.user_message, self.current_user_task, self.resolved_task]).lower()
+        return (
+            ("cli" in text or "команд" in text or "commands" in text)
+            and "python" in text
+            and all(word in text for word in ("version", "fetch", "demo"))
+        )
+
+    @staticmethod
+    def _dependency_demo_main_content() -> str:
+        return (
+            '"""Small requests + rich demo application."""\n\n'
+            "from __future__ import annotations\n\n"
+            "from rich.console import Console\n"
+            "import requests\n\n"
+            "console = Console()\n\n"
+            "def fetch_title() -> str:\n"
+            "    try:\n"
+            "        response = requests.get('https://httpbin.org/json', timeout=10)\n"
+            "        response.raise_for_status()\n"
+            "        try:\n"
+            "            data = response.json()\n"
+            "        except ValueError:\n"
+            "            preview = response.text[:300] or 'Empty response'\n"
+            "            return 'Server returned non-JSON response:\\n' + preview\n"
+            "        return data.get('slideshow', {}).get('title') or 'HTTPBin JSON loaded'\n"
+            "    except requests.RequestException as exc:\n"
+            "        return f'Network unavailable, using fallback: {exc.__class__.__name__}'\n\n"
+            "def main() -> None:\n"
+            "    console.rule('ZenAI dependency demo')\n"
+            "    console.print(fetch_title())\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+
+    @staticmethod
+    def _cli_version_fetch_demo_main_content() -> str:
+        return (
+            '"""Small Typer CLI generated by ZenAI Coder."""\n\n'
+            "from __future__ import annotations\n\n"
+            "import typer\n"
+            "import requests\n"
+            "from rich.console import Console\n\n"
+            "app = typer.Typer(help='ZenAI CLI smoke project')\n"
+            "console = Console()\n\n"
+            "@app.command()\n"
+            "def version() -> None:\n"
+            "    console.print('ZenAI CLI version 0.1.0')\n\n"
+            "@app.command()\n"
+            "def demo() -> None:\n"
+            "    console.print('[bold green]Demo command executed successfully[/bold green]')\n\n"
+            "@app.command()\n"
+            "def fetch() -> None:\n"
+            "    try:\n"
+            "        response = requests.get('https://httpbin.org/json', timeout=10)\n"
+            "        response.raise_for_status()\n"
+            "        try:\n"
+            "            payload = response.json()\n"
+            "        except ValueError:\n"
+            "            console.print('Fetch completed, but the server returned non-JSON content.', style='yellow')\n"
+            "            return\n"
+            "        title = payload.get('slideshow', {}).get('title') or 'HTTPBin JSON loaded'\n"
+            "        console.print(title)\n"
+            "    except requests.RequestException as exc:\n"
+            "        console.print(f'Network unavailable, graceful fallback: {exc.__class__.__name__}', style='yellow')\n\n"
+            "if __name__ == '__main__':\n"
+            "    app()\n"
+        )
+
+    def _build_non_json_response_patch_call(self, path: str = "main.py") -> ToolCall | None:
+        rel = self._safe_rel_path(path, allow_missing=False)
+        if not rel:
+            return None
+        absolute = os.path.join(self.project_root, rel)
+        try:
+            with open(absolute, "r", encoding="utf-8") as f:
+                old = f.read()
+        except OSError:
+            return None
+        if "response.json" not in old and ".json()" not in old:
+            return ToolCall(
+                name="edit_file",
+                args={
+                    "path": rel,
+                    "old_str": old,
+                    "new_str": self._dependency_demo_main_content(),
+                },
+                raw="[controller runtime JSON repair rewrite main.py]",
+            )
+        new = self._dependency_demo_main_content()
+        return ToolCall(
+            name="edit_file",
+            args={"path": rel, "old_str": old, "new_str": new},
+            raw="[controller runtime JSON repair patch main.py]",
+        )
+
+    @staticmethod
+    def _package_for_import(module: str) -> str:
+        mapping = {
+            "PIL": "Pillow",
+            "bs4": "beautifulsoup4",
+            "cv2": "opencv-python",
+            "yaml": "PyYAML",
+        }
+        return mapping.get(module, module)
+
+    def _local_python_modules(self) -> set[str]:
+        modules: set[str] = set()
+        for root, dirs, files in os.walk(self.project_root):
+            dirs[:] = [
+                d for d in dirs
+                if d not in {".git", ".venv", "venv", "__pycache__", "build", "dist", "models"}
+            ]
+            rel_root = os.path.relpath(root, self.project_root)
+            for filename in files:
+                if filename.endswith(".py"):
+                    stem = os.path.splitext(filename)[0]
+                    if stem != "__init__":
+                        modules.add(stem)
+                    if rel_root != ".":
+                        modules.add(rel_root.split(os.sep, 1)[0])
+        return modules
+
+    def _detect_external_dependency_packages(self) -> list[str]:
+        stdlib = set(getattr(sys, "stdlib_module_names", set()))
+        local_modules = self._local_python_modules()
+        imports: set[str] = set()
+        for root, dirs, files in os.walk(self.project_root):
+            dirs[:] = [
+                d for d in dirs
+                if d not in {".git", ".venv", "venv", "__pycache__", "build", "dist", "models"}
+            ]
+            for filename in files:
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(root, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        tree = ast.parse(f.read(), filename=path)
+                except (OSError, SyntaxError):
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            imports.add(alias.name.split(".", 1)[0])
+                    elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                        imports.add(node.module.split(".", 1)[0])
+        packages: list[str] = []
+        for module in sorted(imports):
+            if module in local_modules or module in stdlib or module.startswith("_"):
+                continue
+            if module in {"typing", "dataclasses", "pathlib"}:
+                continue
+            packages.append(self._package_for_import(module))
+        if self._dependency_demo_requested():
+            for package in ("requests", "rich"):
+                if package not in packages:
+                    packages.append(package)
+        if self._cli_version_fetch_demo_requested():
+            for package in ("requests", "rich", "typer"):
+                if package not in packages:
+                    packages.append(package)
+        return sorted(dict.fromkeys(packages), key=str.lower)
+
+    def _requirements_packages(self) -> list[str]:
+        path = os.path.join(self.project_root, "requirements.txt")
+        if not os.path.exists(path):
+            return []
+        packages: list[str] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    package = re.split(r"[<>=~!;\[]", stripped, maxsplit=1)[0].strip()
+                    if package:
+                        packages.append(package)
+        except OSError:
+            return []
+        return packages
+
+    def _is_stdlib_or_local_requirement(self, package: str) -> bool:
+        name = re.split(r"[<>=~!;\[]", str(package or ""), maxsplit=1)[0].strip()
+        if not name:
+            return True
+        module = name.replace("-", "_")
+        stdlib = set(getattr(sys, "stdlib_module_names", set()))
+        return module in stdlib or module in self._local_python_modules()
+
+    def _requirements_need_update(self, packages: list[str]) -> bool:
+        existing = {package.lower() for package in self._requirements_packages()}
+        return any(package.lower() not in existing for package in packages)
+
+    def _sync_requirements_for_dependencies(self, packages: list[str]) -> ToolResult:
+        existing_path = os.path.join(self.project_root, "requirements.txt")
+        existing = [
+            package for package in self._requirements_packages()
+            if not self._is_stdlib_or_local_requirement(package)
+        ]
+        merged = sorted(dict.fromkeys(existing + packages), key=str.lower)
+        content = "\n".join(merged).strip() + "\n"
+        if os.path.exists(existing_path):
+            if "requirements.txt" not in self._read_files:
+                read_call = ToolCall(
+                    name="read_file",
+                    args={"path": "requirements.txt"},
+                    raw="[controller dependency read requirements.txt]",
+                )
+                read_result = self._execute_tool(read_call)
+                if not read_result.ok:
+                    return read_result
+            try:
+                with open(existing_path, "r", encoding="utf-8") as f:
+                    old = f.read()
+            except OSError as exc:
+                return ToolResult.error(str(exc))
+            if old == content:
+                return ToolResult(ok=True, title="requirements.txt", output="[requirements already up to date]")
+            call = ToolCall(
+                name="edit_file",
+                args={"path": "requirements.txt", "old_str": old, "new_str": content},
+                raw="[controller dependency edit requirements.txt]",
+            )
+        else:
+            call = ToolCall(
+                name="write_file",
+                args={"path": "requirements.txt", "content": content},
+                raw="[controller dependency write requirements.txt]",
+            )
+        result = self._execute_tool(call)
+        if result.ok:
+            self._verify_file_goals_after_change(call)
+        return result
+
+    def _default_content_for_file_goal(self, goal: FileGoal) -> str:
+        path = goal.path.replace("\\", "/").lower()
+        if path == "main.py":
+            if self._cli_version_fetch_demo_requested():
+                return self._cli_version_fetch_demo_main_content()
+            if self._dependency_demo_requested():
+                return self._dependency_demo_main_content()
+            return (
+                '"""Minimal project entrypoint created by ZenAI Coder."""\n\n'
+                "def main():\n"
+                "    print(\"ZenAI project scaffold is ready.\")\n\n"
+                "\n"
+                "if __name__ == \"__main__\":\n"
+                "    main()\n"
+            )
+        if path == "requirements.txt":
+            if self._cli_version_fetch_demo_requested():
+                return "requests\nrich\ntyper\n"
+            if self._dependency_demo_requested():
+                return "requests\nrich\n"
+            return "# Add project dependencies here as needed.\n"
+        if path.endswith(".md"):
+            title = os.path.splitext(os.path.basename(goal.path))[0].replace("-", " ").replace("_", " ").title()
+            return f"# {title or 'Project'}\n\nCreated by ZenAI Coder.\n"
+        if path.endswith(".json"):
+            return "{}\n"
+        if path.endswith(".py"):
+            return (
+                '"""Project module created by ZenAI Coder."""\n\n'
+                "def main():\n"
+                "    return None\n"
+            )
+        return f"# {goal.path}\n"
+
+    def _forced_file_goal_call(self, goal: FileGoal) -> ToolCall:
+        abs_path = os.path.join(self.project_root, goal.path)
+        if os.path.exists(abs_path):
+            return ToolCall(
+                name="read_file",
+                args={"path": goal.path},
+                raw=f"[controller-forced read_file {goal.path}]",
+            )
+        return ToolCall(
+            name="write_file",
+            args={"path": goal.path, "content": self._default_content_for_file_goal(goal)},
+            raw=f"[controller-forced write_file {goal.path}]",
+        )
+
+    def _execute_forced_file_goal_call(
+        self,
+        call: ToolCall,
+        transcript: list[str],
+        *,
+        reason: str,
+    ) -> bool:
+        self._log_agent_event(
+            "forced_next_tool",
+            tool=call.name,
+            path=call.args.get("path", ""),
+            reason=reason,
+        )
+        write_log(
+            f"[agent_forced_next_tool] run_id={self._run_id} tool={json.dumps(call.name)} "
+            f"path={json.dumps(str(call.args.get('path', '')))} reason={json.dumps(reason, ensure_ascii=False)}"
+        )
+        verb = "Создаю" if call.name in {"write_file", "create_file"} else "Проверяю"
+        self.chunk_received.emit(f"\n[{verb} {call.args.get('path')} через tool.]\n")
+        transcript.append(
+            "Controller forced tool execution:\n"
+            f"reason={reason}\n"
+            + self._tool_request_summary_for_transcript([call], "")
+        )
+        result = self._execute_tool(call)
+        self._tool_calls_used += 1
+        transcript.append(
+            f"Tool result for {call.name}:\n{self._tool_output_for_transcript(call, result)}"
+        )
+        if result.ok:
+            verification = self._verify_after_change(call)
+            if verification is not None:
+                transcript.append(
+                    f"Verification result for {verification['name']}:\n"
+                    f"{self._tool_output_for_transcript(verification['call'], verification['result'])}"
+                )
+            compile_result = self._run_auto_compile_after_change(call)
+            if compile_result is not None:
+                transcript.append(f"Automatic compile result:\n{compile_result.output}")
+            if call.name in self._mutating_file_tool_names():
+                self._verify_file_goals_after_change(call)
+            return True
+        return False
+
+    def _sync_dependency_state(self) -> None:
+        self.run_state_v3.python_cmd = self._python_cmd
+        self.run_state_v3.pip_install_cmd = self._pip_install_cmd
+        self.run_state_v3.dependency_goals = list(self._dependency_goals)
+        self.run_state_v3.dependency_install_done = self._dependency_install_done
+        self.run_state_v3.dependency_install_evidence = list(self._dependency_install_evidence)
+        self.run_state_v3.import_verification_done = self._import_verification_done
+        self.run_state_v3.app_run_required = self._app_run_required
+        self.run_state_v3.app_run_done = self._app_run_done
+        self.run_state_v3.app_run_evidence = list(self._app_run_evidence)
+
+    def _dependency_workflow_needed(self) -> bool:
+        if self._active_repair:
+            return False
+        self._refresh_file_goal_statuses()
+        if any(goal.required and goal.status.value != "done" for goal in self._file_goals):
+            return False
+        packages = self._detect_external_dependency_packages()
+        if packages:
+            self._dependency_goals = packages
+        if not self._dependency_goals:
+            return False
+        self._app_run_required = (
+            os.path.exists(os.path.join(self.project_root, "main.py"))
+            and not self._command_goals
+        )
+        self._sync_dependency_state()
+        return not (
+            self._dependency_install_done
+            and self._import_verification_done
+            and (not self._app_run_required or self._app_run_done)
+        )
+
+    def _run_dependency_tool(self, command: str, transcript: list[str], *, timeout: int = 120) -> ToolResult:
+        call = ToolCall(
+            name="run_terminal",
+            args={"command": command, "timeout": str(timeout)},
+            raw=f"[controller dependency run_terminal {command}]",
+        )
+        result = self._execute_tool(call)
+        self._tool_calls_used += 1
+        transcript.append(
+            f"Dependency workflow result for {command}:\n"
+            f"{self._tool_output_for_transcript(call, result)}"
+        )
+        return result
+
+    def _import_verify_command(self, packages: list[str]) -> str:
+        modules = sorted({package.split("[", 1)[0].replace("-", "_") for package in packages})
+        mapped = {
+            "beautifulsoup4": "bs4",
+            "pillow": "PIL",
+            "opencv_python": "cv2",
+            "pyyaml": "yaml",
+        }
+        modules = [mapped.get(module.lower(), module) for module in modules]
+        code = "import " + ", ".join(modules) + "; print('deps ok')"
+        return f"{self._python_cmd} -c {self._quote_command_arg(code)}"
+
+    def _python_executable_check_command(self) -> str:
+        code = "import sys; print(sys.executable)"
+        return f"{self._python_cmd} -c {self._quote_command_arg(code)}"
+
+    def _app_run_command(self) -> str:
+        return f"{self._python_cmd} main.py"
+
+    @staticmethod
+    def _missing_module_from_output(output: str) -> str:
+        match = re.search(r"No module named ['\"]([^'\"]+)['\"]", output or "")
+        return match.group(1).split(".", 1)[0] if match else ""
+
+    @staticmethod
+    def _looks_like_network_runtime_error(output: str) -> bool:
+        return bool(re.search(
+            r"requests\.exceptions|ConnectionError|Timeout|SSLError|ProxyError|NameResolutionError|"
+            r"JSONDecodeError|Expecting value: line 1 column 1|response\.json",
+            output or "",
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _looks_like_json_decode_runtime_error(output: str) -> bool:
+        return bool(re.search(
+            r"requests\.exceptions\.JSONDecodeError|JSONDecodeError|"
+            r"Expecting value: line 1 column 1|response\.json",
+            output or "",
+            re.IGNORECASE,
+        ))
+
+    def _patch_main_for_network_fallback(self, transcript: list[str]) -> bool:
+        path = os.path.join(self.project_root, "main.py")
+        if not os.path.exists(path):
+            return False
+        if "main.py" not in self._read_files:
+            read_call = ToolCall(name="read_file", args={"path": "main.py"}, raw="[controller read main.py before network repair]")
+            read_result = self._execute_tool(read_call)
+            self._tool_calls_used += 1
+            transcript.append(
+                "Dependency network repair read result:\n"
+                f"{self._tool_output_for_transcript(read_call, read_result)}"
+            )
+            if not read_result.ok:
+                return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                old = f.read()
+        except OSError:
+            return False
+        new = self._dependency_demo_main_content()
+        if old == new:
+            return False
+        call = ToolCall(
+            name="edit_file",
+            args={"path": "main.py", "old_str": old, "new_str": new},
+            raw="[controller dependency network fallback patch main.py]",
+        )
+        result = self._execute_tool(call)
+        self._tool_calls_used += 1
+        transcript.append(
+            "Dependency network repair patch result:\n"
+            f"{self._tool_output_for_transcript(call, result)}"
+        )
+        if result.ok:
+            verification = self._verify_after_change(call)
+            if verification is not None:
+                transcript.append(
+                    f"Verification result for {verification['name']}:\n"
+                    f"{self._tool_output_for_transcript(verification['call'], verification['result'])}"
+                )
+            self._verify_file_goals_after_change(call)
+        return result.ok
+
+    def _maybe_run_dependency_workflow(self, transcript: list[str]) -> bool:
+        if not self._dependency_workflow_needed():
+            return False
+        if self._dependency_workflow_attempts >= 3:
+            self._mark_blocked("dependency workflow failed after repeated attempts")
+            return False
+        self._dependency_workflow_attempts += 1
+        self._dependency_workflow_active = True
+        try:
+            packages = list(self._dependency_goals)
+            write_log(
+                f"[coder_dependency_workflow] run_id={self._run_id} "
+                f"packages={json.dumps(packages, ensure_ascii=False)} python={json.dumps(self._python_cmd)}"
+            )
+            self.chunk_received.emit("\n[Проверяю Python/interpreter и зависимости проекта.]\n")
+            transcript.append(
+                "Controller dependency workflow:\n"
+                f"packages={packages}\npython_cmd={self._python_cmd}"
+            )
+            version = self._run_dependency_tool(f"{self._python_cmd} --version", transcript, timeout=60)
+            exe_check = self._run_dependency_tool(self._python_executable_check_command(), transcript, timeout=60)
+            if not version.ok or not exe_check.ok:
+                return True
+
+            req_result = self._sync_requirements_for_dependencies(packages)
+            transcript.append(f"Dependency requirements sync:\n{req_result.output}")
+            if not req_result.ok:
+                return True
+
+            self._pip_install_cmd = f"{self._python_cmd} -m pip install -r requirements.txt"
+            install = self._run_dependency_tool(self._pip_install_cmd, transcript, timeout=300)
+            if not install.ok:
+                missing = self._missing_module_from_output(install.output)
+                if missing and missing not in self._dependency_goals:
+                    self._dependency_goals.append(self._package_for_import(missing))
+                return True
+            self._dependency_install_done = True
+            self._dependency_install_evidence.append(self._compact_state_text(install.output))
+
+            verify = self._run_dependency_tool(self._import_verify_command(packages), transcript, timeout=60)
+            if not verify.ok:
+                missing = self._missing_module_from_output(verify.output)
+                if missing and self._package_for_import(missing) not in self._dependency_goals:
+                    self._dependency_goals.append(self._package_for_import(missing))
+                    self._dependency_install_done = False
+                return True
+            self._import_verification_done = True
+
+            if self._app_run_required:
+                run = self._run_dependency_tool(self._app_run_command(), transcript, timeout=120)
+                if not run.ok and self._looks_like_network_runtime_error(run.output):
+                    if self._patch_main_for_network_fallback(transcript):
+                        run = self._run_dependency_tool(self._app_run_command(), transcript, timeout=120)
+                if run.ok:
+                    self._app_run_done = True
+                    self._app_run_evidence.append(self._compact_state_text(run.output))
+                else:
+                    missing = self._missing_module_from_output(run.output)
+                    package = self._package_for_import(missing) if missing else ""
+                    if package and package not in self._dependency_goals:
+                        self._dependency_goals.append(package)
+                        self._dependency_install_done = False
+                        self._import_verification_done = False
+                        self._app_run_done = False
+                        write_log(
+                            f"[coder_dependency_repair] run_id={self._run_id} "
+                            f"missing_module={json.dumps(missing)} package={json.dumps(package)}"
+                        )
+                    return True
+            self._sync_dependency_state()
+            write_log(
+                f"[coder_dependency_workflow_done] run_id={self._run_id} "
+                f"install={json.dumps(self._dependency_install_done)} "
+                f"imports={json.dumps(self._import_verification_done)} "
+                f"app_run={json.dumps(self._app_run_done)}"
+            )
+            return True
+        finally:
+            self._dependency_workflow_active = False
+
+    def _recover_prose_file_intention(self, response: str, transcript: list[str]) -> bool:
+        goal = self._current_pending_file_goal()
+        if goal is None or not self._response_mentions_file_intention(response, goal):
+            return False
+        count = self._prose_file_intent_retries.get(goal.path, 0) + 1
+        self._prose_file_intent_retries[goal.path] = count
+        self._log_agent_event(
+            "prose_intention_detected",
+            path=goal.path,
+            count=count,
+        )
+        write_log(
+            f"[agent_prose_intention_detected] run_id={self._run_id} "
+            f"path={json.dumps(goal.path)} count={count}"
+        )
+        transcript.append(f"Assistant prose intention rejected for FileGoal {goal.path}:\n{response}")
+        if count <= 1:
+            transcript.append("System corrective instruction:\n" + self._forced_file_goal_corrective(goal))
+            self.chunk_received.emit(
+                f"\n[Агент описал создание {goal.path}, но prose не меняет файлы. "
+                "Запрашиваю ровно один write_file tool call.]\n"
+            )
+            return True
+        call = self._forced_file_goal_call(goal)
+        self._execute_forced_file_goal_call(call, transcript, reason="repeated prose file intention")
+        return True
 
     def _tool_output_for_transcript(self, call: ToolCall, result: ToolResult) -> str:
         canonical = self._tools.get(call.name).name if self._tools.get(call.name) else call.name
@@ -2532,9 +3713,13 @@ class AgentWorker(QThread):
             write_log(f"[agent_tool_error] {call.name}: {result.output}")
             return result
 
+        canonical = tool.name
+        normalized_call = self._normalize_repair_full_file_edit(call, canonical)
+        if normalized_call is not call:
+            call = normalized_call
+            payload = {"id": call.id, "name": call.name, "args": call.args}
         key = self._tool_key(call)
         tracks_duplicates = bool(tool.mutates_project or tool.runs_command)
-        canonical = tool.name
         if canonical == "read_file":
             preflight = self._preflight_tool_call(call, tool)
             if preflight is not None:
@@ -2578,6 +3763,22 @@ class AgentWorker(QThread):
                     self._log_tool_result(call, result)
                     self._log_agent_event("read_blocked_verified", path=path, file_state=state)
                     return result
+        if tracks_duplicates and key in self._failed_tool_keys and not self._allow_failed_tool_repeat(tool, call):
+            result = ToolResult(
+                ok=False,
+                title=f"Failed duplicate blocked: {call.name}",
+                output=(
+                    "[failed duplicate: this exact operation already failed. "
+                    "Inspect evidence, repair the cause, or choose a distinct next action before retrying.]"
+                ),
+                meta={"failed_repeat_blocked": True, "tool_key": key},
+            )
+            self.tool_started.emit(payload)
+            self.tool_finished.emit({**payload, "ok": False, "output": result.output, "title": result.title, "meta": result.meta})
+            self._record_tool_call(call, result)
+            self._log_tool_result(call, result)
+            write_log(f"[agent_tool_dedup_failed_repeat_blocked] run_id={self._run_id} tool={call.name}")
+            return result
         if tracks_duplicates and key in self._successful_tool_keys and not self._allow_duplicate_command_goal_rerun(tool, call):
             result = ToolResult(
                 ok=True,
@@ -2592,7 +3793,7 @@ class AgentWorker(QThread):
             self.tool_finished.emit({**payload, "ok": True, "output": result.output, "title": result.title, "meta": result.meta})
             self._record_tool_call(call, result)
             self._log_tool_result(call, result)
-            write_log(f"[agent_tool_duplicate] {call.name}: {result.output}")
+            write_log(f"[agent_tool_dedup_success_skip] run_id={self._run_id} tool={call.name}")
             return result
         if not tracks_duplicates:
             observation_key = (self._state_version, key)
@@ -2743,6 +3944,13 @@ class AgentWorker(QThread):
         if not result.ok:
             self._tool_errors.append(f"{call.name}: {self._compact_state_text(result.output)}")
             self._tool_errors = self._tool_errors[-20:]
+            self._failed_tool_keys.add(self._tool_key(call))
+        else:
+            self._failed_tool_keys.discard(self._tool_key(call))
+        self._save_agent_checkpoint(
+            reason="tool executed",
+            resumable=not self.run_state_v3.final_allowed,
+        )
 
     @staticmethod
     def _mutating_file_tool_names() -> set[str]:
@@ -2943,6 +4151,7 @@ class AgentWorker(QThread):
                     "active_repair": dict(self._active_repair),
                     "repair_touched_relevant": self._repair_touched_relevant,
                     "file_states": {path: dict(state) for path, state in self._file_states.items()},
+                    "dependency_workflow_active": self._dependency_workflow_active,
                 },
             )
             if controller_decision.blocked:
@@ -3015,6 +4224,7 @@ class AgentWorker(QThread):
                 self._is_direct_python_file_run(command)
                 and not self._command_goal_for_command(str(command))
                 and not self._user_asked_to_run()
+                and not self._dependency_workflow_active
             ):
                 return ToolResult.error(
                     "python <file> можно запускать только если пользователь явно попросил; "
@@ -3024,6 +4234,8 @@ class AgentWorker(QThread):
 
     def _command_goal_dependency_error(self, command: str) -> str:
         if not self._command_goals:
+            return ""
+        if self._dependency_workflow_active:
             return ""
         matched_goal = self._command_goal_for_command(command)
         if not matched_goal:
@@ -3117,7 +4329,7 @@ class AgentWorker(QThread):
         for goal in list(self._command_goals):
             if goal in self._command_goals_done:
                 continue
-            command = self._command_goal_example(goal)
+            command = self._command_goal_execution_command(goal)
             call = ToolCall(name="run_terminal", args={"command": command})
             result = self._execute_tool(call)
             lines.append(
@@ -3296,7 +4508,7 @@ class AgentWorker(QThread):
         for goal in list(self._command_goals):
             if goal in self._command_goals_done:
                 continue
-            command = self._command_goal_example(goal)
+            command = self._command_goal_execution_command(goal)
             call = ToolCall(name="run_terminal", args={"command": command})
             result = self._execute_tool(call)
             lines.append(
@@ -3740,11 +4952,12 @@ class AgentWorker(QThread):
 
     @staticmethod
     def _is_direct_python_file_run(command: str) -> bool:
-        parts = command.strip().split()
+        parts = RunTerminalTool._split_command(str(command or ""))
         if len(parts) < 2:
             return False
-        exe = parts[0].lower()
-        if exe not in {"python", "py", "python.exe", "py.exe"}:
+        exe = parts[0].strip('"').lower()
+        exe_name = os.path.basename(exe)
+        if exe_name not in {"python", "py", "python.exe", "py.exe"} and "python" not in exe_name:
             return False
         if len(parts) >= 4 and parts[1:3] == ["-m", "py_compile"]:
             return False
@@ -3903,6 +5116,17 @@ class AgentWorker(QThread):
                 for goal in self._command_goal_specs
             ],
             "command_goals_done": sorted(self._command_goals_done),
+            "python_cmd": self._python_cmd,
+            "pip_install_cmd": self._pip_install_cmd,
+            "dependency_goals": list(self._dependency_goals),
+            "dependency_install_done": self._dependency_install_done,
+            "dependency_install_evidence": list(self._dependency_install_evidence[-3:]),
+            "import_verification_done": self._import_verification_done,
+            "app_run_required": self._app_run_required,
+            "app_run_done": self._app_run_done,
+            "app_run_evidence": list(self._app_run_evidence[-3:]),
+            "dependency_workflow_attempts": self._dependency_workflow_attempts,
+            "runtime_repair_forced_attempts": self._runtime_repair_forced_attempts,
             "todo_cli_added_texts": sorted(self._todo_cli_added_texts),
             "active_repair": dict(self._active_repair),
             "task_ledger": self._ledger.to_summary(),
@@ -3914,6 +5138,8 @@ class AgentWorker(QThread):
             "visual_context": self._compact_state_text(self.visual_context),
         }
         self.continuation_state = {
+            "run_id": self._run_id,
+            "session_id": self._session_id,
             "user_task": original_task,
             "project_root": self.project_root,
             "reason": reason,
@@ -3922,10 +5148,12 @@ class AgentWorker(QThread):
             "transcript_tail": self._compact_transcript_tail(transcript),
             "tool_history": list(self._tool_history),
             "successful_tool_keys": sorted(self._successful_tool_keys),
+            "failed_tool_keys": sorted(self._failed_tool_keys),
             "current_target": last_path,
             "partial_response": partial_response,
             "created_at": time.time(),
         }
+        self._save_agent_checkpoint(reason=reason, resumable=True)
 
     @staticmethod
     def _tool_key(call: ToolCall) -> str:
@@ -3981,6 +5209,23 @@ class AgentWorker(QThread):
         self.status.emit(f"Агент: py_compile {py_path}")
         return self._execute_tool(compile_call)
 
+    def _is_controller_dependency_install_command(self, command: str) -> bool:
+        if not command or not self._pip_install_cmd:
+            return False
+        try:
+            normalized = " ".join(RunTerminalTool._split_command(command))
+            expected = " ".join(RunTerminalTool._split_command(self._pip_install_cmd))
+        except ValueError:
+            return False
+        if normalized != expected:
+            return False
+        req_path = os.path.realpath(os.path.join(self.project_root, "requirements.txt"))
+        try:
+            common = os.path.commonpath([self.project_root, req_path])
+        except ValueError:
+            return False
+        return common == self.project_root and os.path.exists(req_path)
+
     def _detect_test_command(self) -> str:
         if (
             os.path.exists(os.path.join(self.project_root, "pytest.ini"))
@@ -4005,13 +5250,17 @@ class AgentWorker(QThread):
         if self.confirmation_policy == "confirm_all":
             return True
         if tool.runs_command and call is not None and hasattr(tool, "classify_command"):
-            safety, reason = tool.classify_command(call.args.get("command", ""))
+            command = call.args.get("command", "")
+            if self._is_controller_dependency_install_command(str(command)):
+                write_log(f"[agent_terminal_auto_safe] {command}: controller dependency install")
+                return False
+            safety, reason = tool.classify_command(command)
             if safety == "blocked":
                 return False
             if safety == "needs_confirmation":
-                write_log(f"[agent_terminal_confirmation] {call.args.get('command', '')}: {reason}")
+                write_log(f"[agent_terminal_confirmation] {command}: {reason}")
                 return True
-            write_log(f"[agent_terminal_auto_safe] {call.args.get('command', '')}: {reason}")
+            write_log(f"[agent_terminal_auto_safe] {command}: {reason}")
             return False
         if self.confirmation_policy == "auto_confirm":
             return False

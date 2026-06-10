@@ -16,6 +16,39 @@ from core.profiles import AIProfile, ProfileKind
 from ui.main_window import ZenEditor
 
 
+USER_VISIBLE_RESEARCH_GARBAGE = [
+    "[truncated]",
+    "ascii codec",
+    "HTTP Error",
+    "binary_content",
+    "empty_page",
+    "js_only_suspected",
+    "not_human_readable",
+    "js_bootstrap",
+    "window.initData",
+    "window.gokuProps",
+    "document.documentElement",
+    "font-family",
+    "Traceback",
+    "Connection refused",
+    "function(",
+    "OptanonWrapper",
+    "schema.org",
+    "@context",
+    "@graph",
+    "Client Challenge",
+    "A required part of this site",
+    "webpack",
+    "__NEXT_DATA__",
+]
+
+
+def assert_no_user_visible_research_garbage(testcase: unittest.TestCase, text: object) -> None:
+    rendered = str(text or "")
+    for token in USER_VISIBLE_RESEARCH_GARBAGE:
+        testcase.assertNotIn(token, rendered, f"Source card UI leaked {token!r}: {rendered[:300]}")
+
+
 def profile(pid: str, kind: ProfileKind, name: str) -> AIProfile:
     return AIProfile(id=pid, name=name, kind=kind, model_file=f"{pid}.gguf")
 
@@ -254,6 +287,29 @@ class ChatSessionUiTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_noisy_source_card_hides_raw_js_dump(self):
+        window = ZenEditor()
+        try:
+            window._render_research_sources([{
+                "id": "S1",
+                "title": "TradingView",
+                "url": "https://example.com/tv",
+                "domain": "example.com",
+                "excerpt": "window.initData = {}; document.documentElement.className='x'; body { font-family: Arial; }",
+                "read_ok": False,
+                "status": "js_bootstrap",
+                "relevance_score": 0.4,
+            }])
+
+            cards = window.sources_container.findChildren(QFrame, "sourceCard")
+            self.assertEqual(len(cards), 1)
+            text = " ".join(label.text() for label in cards[0].findChildren(QLabel))
+            self.assertIn("not readable", text)
+            self.assertIn("технический код", text)
+            assert_no_user_visible_research_garbage(self, text)
+        finally:
+            window.close()
+
     def test_sources_ready_updates_workspace_for_searcher(self):
         window = ZenEditor()
         try:
@@ -275,6 +331,29 @@ class ChatSessionUiTests(unittest.TestCase):
             self.assertEqual(window.active_workspace_tab, "sources")
             self.assertIn("1 источников", window.workspace_reason_label.text())
             self.assertTrue(window.sources_container.findChildren(QFrame, "sourceCard"))
+        finally:
+            window.close()
+
+    def test_searcher_route_log_does_not_include_raw_private_text(self):
+        window = ZenEditor()
+        try:
+            researcher = AIProfile(
+                id="researcher-test",
+                name="Поисковик",
+                kind=ProfileKind.RESEARCHER,
+                model_file="researcher.gguf",
+            )
+            private_query = '```python\nSECRET_KEY = "abc123"\n```\nПоищи почему ошибка'
+            with mock.patch("core.diagnostics.write_log") as write_log:
+                self.assertTrue(window._research_requires_pipeline(researcher, private_query))
+
+            rendered = "\n".join(str(call.args[0]) for call in write_log.call_args_list)
+            self.assertIn("searcher_route_research", rendered)
+            self.assertIn("chars=", rendered)
+            self.assertIn("hash=", rendered)
+            self.assertNotIn("SECRET_KEY", rendered)
+            self.assertNotIn("abc123", rendered)
+            self.assertNotIn("Поищи почему ошибка", rendered)
         finally:
             window.close()
 

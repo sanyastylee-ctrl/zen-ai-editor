@@ -28,11 +28,21 @@ from .file_goals import (
 )
 from .project_map import build_project_map
 from .repair import TracebackFrame, TracebackInfo, parse_traceback
+from .checkpoint import (
+    AgentRunCheckpoint,
+    checkpoint_path,
+    latest_resumable_checkpoint,
+    load_checkpoint,
+    mark_checkpoint_dismissed,
+    mark_checkpoint_done,
+    save_checkpoint,
+)
 
 __all__ = [
     "AgentPhase",
     "AgentRunStateV3",
     "AgentIntent",
+    "AgentRunCheckpoint",
     "CommandGoal",
     "CoderAgentController",
     "EvaluationResult",
@@ -51,8 +61,14 @@ __all__ = [
     "extract_file_goals",
     "evaluate_final_readiness",
     "build_project_map",
+    "checkpoint_path",
+    "latest_resumable_checkpoint",
+    "load_checkpoint",
+    "mark_checkpoint_dismissed",
+    "mark_checkpoint_done",
     "normalize_command",
     "parse_traceback",
+    "save_checkpoint",
     "serialize_file_goals",
     "verify_file_goal",
 ]

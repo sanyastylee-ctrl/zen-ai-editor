@@ -132,6 +132,16 @@ class AgentRunStateV3:
     command_goals: list[str] = field(default_factory=list)
     command_goals_done: list[str] = field(default_factory=list)
     command_goals_failed: list[str] = field(default_factory=list)
+    python_cmd: str = ""
+    pip_install_cmd: str = ""
+    project_venv_path: str = ""
+    dependency_goals: list[str] = field(default_factory=list)
+    dependency_install_done: bool = False
+    dependency_install_evidence: list[str] = field(default_factory=list)
+    import_verification_done: bool = False
+    app_run_required: bool = False
+    app_run_done: bool = False
+    app_run_evidence: list[str] = field(default_factory=list)
     test_goals: list[str] = field(default_factory=list)
     failed_commands: list[str] = field(default_factory=list)
     failed_tests: list[str] = field(default_factory=list)

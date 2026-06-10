@@ -25,11 +25,13 @@ from ai.coder_agent import (
     TaskStatus,
     TaskType,
     build_project_map,
+    checkpoint_path,
     detect_lazy_placeholders,
     evaluate_final_readiness,
     extract_file_goals,
     normalize_command,
     parse_traceback,
+    load_checkpoint,
     verify_file_goal,
 )
 from ai.coder_agent.guards import final_with_pending_goals_guard
@@ -101,10 +103,13 @@ class AgentToolFlowTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.old_logs = app_data.LOGS_DIR
+        self.old_agent_runs = app_data.AGENT_RUNS_DIR
         app_data.LOGS_DIR = self.root / "logs"
+        app_data.AGENT_RUNS_DIR = self.root / "agent_runs"
 
     def tearDown(self):
         app_data.LOGS_DIR = self.old_logs
+        app_data.AGENT_RUNS_DIR = self.old_agent_runs
         self.tmp.cleanup()
 
     def run_worker(self, outputs: list[str], **kwargs):
@@ -840,6 +845,31 @@ Tool result for read_file:
         self.assertTrue(decision.blocked)
         self.assertIn("out-of-order", decision.reason)
 
+    def test_controller_allows_dependency_workflow_command_during_active_workflow(self):
+        state = AgentRunStateV3("run", "task", "task")
+        ledger = TaskLedger([
+            TaskLedgerItem(
+                id="cmd-1",
+                description="Run version",
+                type=TaskType.RUN_COMMAND,
+                required_tool="run_terminal",
+                command="python main.py version",
+            )
+        ])
+        controller = CoderAgentController(state, ledger)
+        controller.set_phase(AgentPhase.EXECUTE)
+
+        decision = controller.validate_tool_call(
+            ToolCall(
+                "run_terminal",
+                {"command": '"D:\\Zen Ai Editor\\.venv\\Scripts\\python.exe" -m pip install -r requirements.txt'},
+                "",
+            ),
+            {"dependency_workflow_active": True},
+        )
+
+        self.assertFalse(decision.blocked)
+
     def test_controller_blocks_repair_rerun_before_relevant_patch(self):
         state = AgentRunStateV3("run", "task", "task")
         ledger = TaskLedger([
@@ -958,6 +988,11 @@ Tool result for read_file:
         self.assertIsNotNone(worker.continuation_state)
         self.assertEqual(worker.continuation_state["summary"]["auto_continue_count"], 1)
         self.assertTrue(events)
+        checkpoint = load_checkpoint(worker._run_id)
+        self.assertIsNotNone(checkpoint)
+        self.assertTrue(checkpoint.resumable)
+        self.assertEqual(checkpoint.auto_resume_count, 1)
+        self.assertEqual(checkpoint.run_id, worker._run_id)
 
     def test_max_auto_continues_stops_with_blocker(self):
         profile = agent_profile()
@@ -983,6 +1018,145 @@ Tool result for read_file:
         self.assertFalse(worker.auto_continue_requested)
         self.assertTrue(blocked)
         self.assertIn("лимит tool calls", blocked[-1]["blocker_reason"])
+
+    def test_resume_prompt_uses_checkpoint_even_without_continue_word(self):
+        state = {
+            "run_id": "resume123",
+            "summary": {
+                "task": "Создай main.py и requirements.txt",
+                "changed_files": ["main.py"],
+                "verified_files": ["main.py"],
+                "file_goals": [
+                    {"path": "main.py", "status": "done"},
+                    {"path": "requirements.txt", "status": "planned"},
+                ],
+                "next_step": "Continue with the next unfinished file: requirements.txt.",
+                "auto_continue_count": 1,
+            },
+            "reason": "достигнут лимит итераций",
+            "successful_tool_keys": [],
+            "tool_history": [],
+        }
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай main.py и requirements.txt",
+            project_root=str(self.root),
+            continuation_state=state,
+        )
+
+        transcript = worker._initial_transcript()
+
+        self.assertEqual(worker._run_id, "resume123")
+        joined = "\n".join(transcript)
+        self.assertIn("Continue this Coder run from the saved checkpoint", joined)
+        self.assertIn("requirements.txt", joined)
+        self.assertIn("Do not restart", joined)
+
+    def test_successful_tool_dedup_survives_checkpoint_resume(self):
+        call = ToolCall("write_file", {"path": "main.py", "content": "print('ok')\n"}, "")
+        first = AgentWorker(agent_profile(), "создай main.py", project_root=str(self.root))
+        first._needs_confirmation = lambda tool, call=None: False
+        result = first._execute_tool(call)
+        self.assertTrue(result.ok)
+        first._save_continuation_state("достигнут лимит tool calls", ["transcript"])
+
+        resumed = AgentWorker(
+            agent_profile(),
+            "создай main.py",
+            project_root=str(self.root),
+            continuation_state=first.continuation_state,
+        )
+        duplicate = resumed._execute_tool(call)
+
+        self.assertTrue(duplicate.ok)
+        self.assertTrue(duplicate.meta.get("duplicate"))
+        self.assertEqual((self.root / "main.py").read_text(encoding="utf-8"), "print('ok')\n")
+
+    def test_failed_tool_repeat_is_blocked_after_resume(self):
+        call = ToolCall("run_terminal", {"command": "python missing.py"}, "")
+        first = AgentWorker(agent_profile(), "запусти python missing.py", project_root=str(self.root))
+        first._needs_confirmation = lambda tool, call=None: False
+        result = first._execute_tool(call)
+        self.assertFalse(result.ok)
+        first._save_continuation_state("достигнут лимит tool calls", ["transcript"])
+
+        resumed = AgentWorker(
+            agent_profile(),
+            "запусти python missing.py",
+            project_root=str(self.root),
+            continuation_state=first.continuation_state,
+        )
+        duplicate = resumed._execute_tool(call)
+
+        self.assertFalse(duplicate.ok)
+        self.assertTrue(duplicate.meta.get("failed_repeat_blocked"))
+
+    def test_failed_dedup_allows_changed_command_strategy(self):
+        first_call = ToolCall("run_terminal", {"command": "python missing.py"}, "")
+        changed_call = ToolCall("run_terminal", {"command": "py missing.py"}, "")
+        worker = AgentWorker(agent_profile(), "запусти missing.py", project_root=str(self.root))
+        worker._failed_tool_keys.add(worker._tool_key(first_call))
+
+        result = worker._preflight_tool_call(changed_call, worker._tools["run_terminal"])
+
+        self.assertIsNone(result)
+
+    def test_user_stop_checkpoint_remains_resumable(self):
+        worker = AgentWorker(agent_profile(), "создай main.py", project_root=str(self.root))
+
+        worker._save_continuation_state("остановлено пользователем", ["transcript"])
+        worker._mark_blocked("остановлено пользователем")
+
+        checkpoint = load_checkpoint(worker._run_id)
+        self.assertIsNotNone(checkpoint)
+        self.assertTrue(checkpoint.resumable)
+        self.assertEqual(checkpoint.stop_reason, "остановлено пользователем")
+
+    def test_dependency_install_resume_starts_from_pending_install(self):
+        (self.root / "main.py").write_text(
+            "import requests\nfrom rich.console import Console\nprint('ok')\n",
+            encoding="utf-8",
+        )
+        (self.root / "requirements.txt").write_text("requests\nrich\n", encoding="utf-8")
+        first = AgentWorker(
+            agent_profile(),
+            "Создай requests/rich app и проверь запуск",
+            project_root=str(self.root),
+        )
+        first._file_goals = [
+            FileGoal(path="main.py", status=FileGoalStatus.DONE),
+            FileGoal(path="requirements.txt", status=FileGoalStatus.DONE),
+        ]
+        first._dependency_goals = ["requests", "rich"]
+        first._dependency_install_done = False
+        first._import_verification_done = False
+        first._app_run_required = True
+        first._app_run_done = False
+        first._save_continuation_state("достигнут лимит tool calls", ["transcript"])
+
+        resumed = AgentWorker(
+            agent_profile(),
+            "Создай requests/rich app и проверь запуск",
+            project_root=str(self.root),
+            continuation_state=first.continuation_state,
+        )
+        resumed._needs_confirmation = lambda tool, call=None: False
+        commands: list[str] = []
+
+        def fake_run(command: str, transcript: list[str], *, timeout: int = 120):
+            commands.append(command)
+            return ToolResult(ok=True, output=f"$ {command}\nok\n[exit 0]", meta={"exit_code": 0})
+
+        resumed._run_dependency_tool = fake_run
+        transcript: list[str] = []
+
+        self.assertTrue(resumed._maybe_run_dependency_workflow(transcript))
+
+        self.assertTrue(any(" -m pip install -r requirements.txt" in command for command in commands))
+        self.assertEqual(commands[-1], resumed._app_run_command())
+        self.assertTrue(resumed._dependency_install_done)
+        self.assertTrue(resumed._import_verification_done)
+        self.assertTrue(resumed._app_run_done)
 
     def test_agent_progress_overlay_renders_snapshot_and_collapses(self):
         overlay = AgentProgressOverlay()
@@ -1387,6 +1561,59 @@ Tool result for read_file:
         self.assertIn("Готово: каркас создан", "".join(chunks))
         self.assertNotIn("опишите изменения", "".join(chunks).lower())
         self.assertIsNone(worker.continuation_state)
+
+    def test_prose_only_generic_file_intention_recovers_with_forced_file_tools(self):
+        prose = "Давайте создадим файл main.py. Теперь создадим файл requirements.txt."
+
+        _, chunks, results, worker = self.run_worker(
+            [prose, prose, prose, prose, "Готово."],
+            user_message="Сам создай в корне проекта необходимые файлы",
+            max_agent_steps=8,
+        )
+
+        self.assertTrue((self.root / "main.py").exists())
+        self.assertTrue((self.root / "requirements.txt").exists())
+        self.assertIn("ZenAI project scaffold is ready", (self.root / "main.py").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["name"] for item in results],
+            ["write_file", "read_file", "write_file", "read_file"],
+        )
+        self.assertEqual([goal.path for goal in worker._file_goals], ["main.py", "requirements.txt"])
+        self.assertTrue(all(goal.status.value == "done" for goal in worker._file_goals))
+        joined = "".join(chunks)
+        self.assertNotIn("Давайте создадим файл main.py", joined)
+        self.assertNotIn("обнаружен повторяющийся цикл без прогресса", joined)
+
+    def test_prose_intention_first_turn_forces_prompt_before_fallback(self):
+        prose = "Теперь создадим файл main.py."
+        tool = """
+<tool name="write_file">
+<path>main.py</path>
+<content>print("from model")
+</content>
+</tool>
+"""
+
+        model, chunks, results, _ = self.run_worker(
+            [prose, tool, "Готово."],
+            user_message="Сам создай в корне проекта необходимые файлы",
+            max_agent_steps=5,
+        )
+
+        self.assertIn("write_file for main.py", model.prompts[1])
+        self.assertIn('print("from model")', (self.root / "main.py").read_text(encoding="utf-8"))
+        self.assertEqual([item["name"] for item in results[:2]], ["write_file", "read_file"])
+        self.assertIn("prose не меняет файлы", "".join(chunks))
+
+    def test_existing_file_prose_recovery_reads_not_blind_overwrite(self):
+        (self.root / "main.py").write_text("print('keep')\n", encoding="utf-8")
+        worker = AgentWorker(agent_profile(), "измени main.py", project_root=str(self.root))
+        goal = worker._file_goals[0]
+        call = worker._forced_file_goal_call(goal)
+
+        self.assertEqual((self.root / "main.py").read_text(encoding="utf-8"), "print('keep')\n")
+        self.assertEqual(call.name, "read_file")
+        self.assertEqual(call.args["path"], "main.py")
 
     def test_agent_prompt_does_not_pass_old_greeting_as_assistant_role(self):
         history = [("Привет", "Привет! Готов помочь."), ("создай hello.py", "План:\n1. Создам hello.py.\nНапишите «давай».")]
@@ -2614,6 +2841,18 @@ Tool result for read_file:
             "[exit 1]"
         )
 
+    def _json_decode_output(self, command: str = "python main.py") -> str:
+        main = self.root / "main.py"
+        return (
+            f"$ {command}\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{main}\", line 10, in <module>\n"
+            "    data = response.json()\n"
+            "  File \"requests/models.py\", line 980, in json\n"
+            "requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n"
+            "[exit 1]"
+        )
+
     def test_traceback_parser_extracts_file_line_and_error_type(self):
         info = parse_traceback(self._traceback_output(), self.root)
 
@@ -2641,6 +2880,137 @@ Tool result for read_file:
         self.assertIn("calculator.py", worker._active_repair.get("target_files"))
         self.assertTrue(any(item["id"] == "repair-traceback" for item in worker._ledger.to_summary()))
         self.assertFalse(worker._final_evaluation().allowed)
+
+    def test_jsondecode_runtime_error_creates_non_json_repair_item(self):
+        (self.root / "main.py").write_text(
+            "import requests\n"
+            "from rich.console import Console\n"
+            "console = Console()\n"
+            "response = requests.get('https://httpbin.org/json')\n"
+            "data = response.json()\n"
+            "console.print(data)\n",
+            encoding="utf-8",
+        )
+        worker = AgentWorker(
+            agent_profile(),
+            "Запусти main.py и если ответ сервера не JSON сам почини код.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        call = ToolCall(name="run_terminal", args={"command": "python main.py"})
+
+        worker._record_command_result(call, ToolResult(ok=False, output=self._json_decode_output()))
+
+        self.assertEqual(worker._active_repair.get("id"), "repair-runtime-json")
+        self.assertEqual(worker._active_repair.get("failure_type"), "handle_non_json_response")
+        self.assertEqual(worker._active_repair.get("next_required_action"), "read_file main.py")
+        self.assertIn("main.py", worker._active_repair.get("target_files"))
+        self.assertIn("python main.py", worker._command_goals)
+        self.assertFalse(worker._final_evaluation().allowed)
+
+    def test_invalid_empty_tool_xml_during_json_repair_forces_read_file(self):
+        (self.root / "main.py").write_text("import requests\nresponse = requests.get('x')\nresponse.json()\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Запусти main.py и почини JSONDecodeError.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        worker._record_command_result(
+            ToolCall(name="run_terminal", args={"command": "python main.py"}),
+            ToolResult(ok=False, output=self._json_decode_output()),
+        )
+        transcript: list[str] = []
+
+        self.assertTrue(worker._recover_runtime_repair_action("<tool name=\"read_file\">", transcript, reason="bad xml", parser_errors=True))
+        self.assertNotIn("main.py", worker._read_files)
+        self.assertTrue(worker._recover_runtime_repair_action("<tool name=\"read_file\">", transcript, reason="bad xml", parser_errors=True))
+
+        self.assertIn("main.py", worker._read_files)
+        self.assertTrue(any("Forced runtime repair result for read_file" in item for item in transcript))
+
+    def test_prose_only_json_repair_explanation_forces_read_file(self):
+        (self.root / "main.py").write_text("import requests\nresponse = requests.get('x')\nresponse.json()\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Запусти main.py и почини JSONDecodeError.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        worker._record_command_result(
+            ToolCall(name="run_terminal", args={"command": "python main.py"}),
+            ToolResult(ok=False, output=self._json_decode_output()),
+        )
+
+        self.assertTrue(worker._recover_runtime_repair_action("Давайте проверим main.py.", [], reason="prose-only"))
+
+        self.assertIn("main.py", worker._read_files)
+
+    def test_non_json_http_response_patch_handles_valueerror_and_requestexception(self):
+        original = (
+            "import requests\n"
+            "from rich.console import Console\n"
+            "console = Console()\n"
+            "response = requests.get('https://httpbin.org/json')\n"
+            "data = response.json()\n"
+            "console.print(data)\n"
+        )
+        (self.root / "main.py").write_text(original, encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай requests/rich app и проверь запуск.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        worker._read_files.add("main.py")
+        call = worker._build_non_json_response_patch_call("main.py")
+
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "edit_file")
+        patched = call.args["new_str"]
+        self.assertIn("response.raise_for_status()", patched)
+        self.assertIn("except ValueError", patched)
+        self.assertIn("except requests.RequestException", patched)
+        self.assertIn("response.text[:300]", patched)
+
+    def test_final_blocked_if_json_repair_patch_not_rerun(self):
+        (self.root / "main.py").write_text("import requests\nresponse = requests.get('x')\nresponse.json()\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Запусти main.py и почини JSONDecodeError.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        call = ToolCall(name="run_terminal", args={"command": "python main.py"})
+        worker._record_command_result(call, ToolResult(ok=False, output=self._json_decode_output()))
+        worker._record_file_state(
+            ToolCall(name="edit_file", args={"path": "main.py", "old_str": "response.json()", "new_str": "safe_json()"}),
+            ToolResult(ok=True, output="edited", meta={"path": "main.py"}),
+        )
+
+        self.assertFalse(worker._final_evaluation().allowed)
+        self.assertIn("pending repair", worker._final_evaluation().reason)
+
+    def test_json_repair_rerun_allowed_after_patch_evidence(self):
+        (self.root / "main.py").write_text("import requests\nresponse = requests.get('x')\nresponse.json()\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Запусти main.py и почини JSONDecodeError.",
+            project_root=str(self.root),
+            confirmation_policy="auto_confirm",
+        )
+        call = ToolCall(name="run_terminal", args={"command": "python main.py"})
+        worker._record_command_result(call, ToolResult(ok=False, output=self._json_decode_output()))
+        worker._record_file_state(
+            ToolCall(name="edit_file", args={"path": "main.py", "old_str": "response.json()", "new_str": "safe_json()"}),
+            ToolResult(ok=True, output="edited", meta={"path": "main.py"}),
+        )
+
+        self.assertIsNone(worker._preflight_tool_call(call, worker._tools["run_terminal"]))
+
+        worker._record_command_result(call, ToolResult(ok=True, output="$ python main.py\nServer returned non-JSON response\n[exit 0]"))
+        self.assertFalse(worker._active_repair)
+        self.assertTrue(worker._final_evaluation().allowed)
 
     def test_traceback_task_does_not_inherit_old_todo_command_goals_from_history(self):
         worker = AgentWorker(
@@ -3573,6 +3943,354 @@ def divide(a, b):
         self.assertTrue(all(goal.status == FileGoalStatus.DONE for goal in worker._file_goals))
         self.assertTrue(worker.run_state_v3.final_allowed)
         self.assertIn("Готово", "".join(chunks))
+
+    def test_terminal_allows_quoted_python_path_and_inline_import_check(self):
+        tool = RunTerminalTool(str(self.root))
+        quoted = f'"{Path(os.sys.executable)}" -c "import sys; print(sys.executable)"'
+
+        safety, reason = tool.classify_command(quoted)
+
+        self.assertEqual(safety, "safe", reason)
+
+    def test_terminal_allows_unquoted_absolute_windows_python_without_spaces(self):
+        tool = RunTerminalTool(str(self.root))
+        command = r'C:\Python314\python.exe -c "import sys; print(sys.executable)"'
+
+        safety, reason = tool.classify_command(command)
+
+        self.assertEqual(safety, "safe", reason)
+
+    def test_terminal_repairs_unquoted_windows_python_path_with_spaces(self):
+        tool = RunTerminalTool(str(self.root))
+        command = f'{Path(os.sys.executable)} -c "print(123)"'
+
+        safety, reason = tool.classify_command(command)
+        result = tool.execute(ToolCall("run_terminal", {"command": command}, ""))
+
+        self.assertEqual(safety, "safe", reason)
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("123", result.output)
+
+    def test_controller_workflow_success_finalizes_before_extra_model_command(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай requests/rich app и проверь запуск.",
+            project_root=str(self.root),
+        )
+        chunks: list[str] = []
+        worker.chunk_received.connect(chunks.append)
+        worker._dependency_goals = ["requests", "rich"]
+        worker._dependency_install_done = True
+        worker._import_verification_done = True
+        worker._app_run_required = True
+        worker._app_run_done = True
+        worker._pip_install_cmd = f"{worker._python_cmd} -m pip install -r requirements.txt"
+        worker._changed_files.add("main.py")
+        worker._written_files.add("main.py")
+        worker._file_goals = []
+        worker._ledger = TaskLedger()
+        worker._controller.ledger = worker._ledger
+
+        self.assertTrue(worker._maybe_finalize_after_controller_workflow())
+
+        self.assertTrue(worker.run_state_v3.final_allowed)
+        self.assertIn("Готово", "".join(chunks))
+
+    def test_blocked_terminal_command_has_blocked_meta_and_not_success(self):
+        result = RunTerminalTool(str(self.root)).execute(
+            ToolCall("run_terminal", {"command": "python main.py && echo bad"}, "")
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.meta.get("blocked"))
+        self.assertIn("shell control", result.meta.get("reason", ""))
+
+    def test_bare_pip_requires_confirmation_but_controller_python_m_pip_is_auto(self):
+        worker = AgentWorker(agent_profile(), "создай проект", project_root=str(self.root))
+        (self.root / "requirements.txt").write_text("requests\n", encoding="utf-8")
+        python_cmd = worker._quote_command_arg(os.sys.executable)
+        worker._pip_install_cmd = f"{python_cmd} -m pip install -r requirements.txt"
+        terminal = worker._tools["run_terminal"]
+
+        self.assertTrue(
+            worker._needs_confirmation(
+                terminal,
+                ToolCall("run_terminal", {"command": "pip install requests"}, ""),
+            )
+        )
+        self.assertFalse(
+            worker._needs_confirmation(
+                terminal,
+                ToolCall("run_terminal", {"command": worker._pip_install_cmd}, ""),
+            )
+        )
+
+    def test_dependency_detection_from_imports_requests_rich(self):
+        (self.root / "main.py").write_text(
+            "import requests\nfrom rich.console import Console\nimport json\n",
+            encoding="utf-8",
+        )
+        worker = AgentWorker(agent_profile(), "создай requests rich app", project_root=str(self.root))
+
+        packages = worker._detect_external_dependency_packages()
+
+        self.assertIn("requests", packages)
+        self.assertIn("rich", packages)
+        self.assertNotIn("json", packages)
+
+    def test_cli_version_fetch_demo_task_creates_file_and_command_goals(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай CLI Python-проект с requests, rich и typer. Нужны команды version, fetch и demo.",
+            project_root=str(self.root),
+        )
+
+        self.assertIn("main.py", [goal.path for goal in worker._file_goals])
+        self.assertIn("requirements.txt", [goal.path for goal in worker._file_goals])
+        self.assertEqual(
+            worker._command_goals,
+            [
+                "python main.py version",
+                "python main.py demo",
+                "python main.py fetch",
+            ],
+        )
+
+    def test_run_then_repair_task_runs_before_edit_file_goal(self):
+        (self.root / "main.py").write_text(
+            "def main():\n    print(json.dumps({'ok': True}))\n\nif __name__ == '__main__':\n    main()\n",
+            encoding="utf-8",
+        )
+        worker = AgentWorker(
+            agent_profile(),
+            "Проверь проект, запусти main.py, найди ошибку по traceback, сам исправь код и добейся успешного запуска.",
+            project_root=str(self.root),
+        )
+
+        self.assertEqual(worker._command_goals, ["python main.py"])
+        self.assertEqual(worker._file_goals, [])
+        self.assertEqual(worker._ledger.current_item().command, "python main.py")
+
+    def test_repair_empty_old_str_edit_is_normalized_to_current_file(self):
+        original = "def main():\n    print(json.dumps({'ok': True}))\n"
+        (self.root / "main.py").write_text(original, encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Проверь проект, запусти main.py, найди ошибку по traceback, сам исправь код.",
+            project_root=str(self.root),
+        )
+        worker._active_repair = {"target_files": ["main.py"], "failure_type": "traceback_error"}
+        worker._read_files.add("main.py")
+        call = ToolCall(
+            "edit_file",
+            {"path": "main.py", "old_str": "", "new_str": "import json\n\n" + original},
+            "",
+        )
+
+        normalized = worker._normalize_repair_full_file_edit(call, "edit_file")
+
+        self.assertEqual(normalized.args["old_str"], original)
+        self.assertTrue(str(normalized.args["new_str"]).startswith("import json"))
+
+    def test_ledger_marks_absolute_python_command_goal_done_by_normalized_match(self):
+        ledger = TaskLedger([
+            TaskLedgerItem(
+                id="cmd-1",
+                description="Run main",
+                type=TaskType.RUN_COMMAND,
+                command="python main.py",
+            )
+        ])
+        call = ToolCall(
+            "run_terminal",
+            {"command": '"D:\\Zen Ai Editor\\.venv\\Scripts\\python.exe" main.py'},
+            "",
+        )
+
+        ledger.record_tool_result(call, ToolResult(ok=True, output="[exit 0]"), matched_command_goal="python main.py")
+
+        self.assertEqual(ledger.items[0].status, TaskStatus.DONE)
+
+    def test_repair_completion_marks_stale_fix_items_done(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Проверь проект, запусти main.py, найди ошибку по traceback, сам исправь код.",
+            project_root=str(self.root),
+        )
+        worker._command_goals = ["python main.py"]
+        worker._command_goals_done = {"python main.py"}
+        worker._ledger = TaskLedger([
+            TaskLedgerItem(id="cmd-1", description="Run main", type=TaskType.RUN_COMMAND, command="python main.py"),
+            TaskLedgerItem(id="repair-traceback", description="Fix traceback", type=TaskType.FIX),
+            TaskLedgerItem(id="repair-cli-command-goals", description="Fix syntax", type=TaskType.FIX),
+        ])
+        worker._active_repair = {"id": "repair-cli-command-goals"}
+
+        worker._complete_active_repair("all command goals verified after repair")
+
+        self.assertTrue(all(item.status == TaskStatus.DONE for item in worker._ledger.items))
+
+    def test_cli_version_fetch_demo_dependencies_include_typer_from_task(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай CLI Python-проект с requests, rich и typer. Нужны команды version, fetch и demo.",
+            project_root=str(self.root),
+        )
+
+        packages = worker._detect_external_dependency_packages()
+
+        self.assertEqual(packages, ["requests", "rich", "typer"])
+
+    def test_cli_command_goal_matches_selected_python_path_with_spaces(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай CLI Python-проект с requests, rich и typer. Нужны команды version, fetch и demo.",
+            project_root=str(self.root),
+        )
+        worker._python_cmd = '"D:\\Zen Ai Editor\\.venv\\Scripts\\python.exe"'
+        command = worker._command_goal_execution_command("python main.py version")
+
+        self.assertEqual(
+            command,
+            '"D:\\Zen Ai Editor\\.venv\\Scripts\\python.exe" main.py version',
+        )
+        self.assertEqual(
+            worker._command_goal_for_command(command),
+            "python main.py version",
+        )
+
+    def test_dependency_workflow_commands_bypass_command_goal_order_guard(self):
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай CLI Python-проект с requests, rich и typer. Нужны команды version, fetch и demo.",
+            project_root=str(self.root),
+        )
+        worker._dependency_workflow_active = True
+
+        self.assertEqual(
+            worker._command_goal_dependency_error(f"{worker._python_cmd} --version"),
+            "",
+        )
+        self.assertEqual(
+            worker._command_goal_dependency_error(worker._import_verify_command(["requests", "rich", "typer"])),
+            "",
+        )
+
+    def test_dependency_detection_excludes_tkinter_stdlib(self):
+        (self.root / "main.py").write_text(
+            "import tkinter\nimport pathlib\nimport requests\nfrom rich.console import Console\n",
+            encoding="utf-8",
+        )
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай приложение с tkinter, requests и rich",
+            project_root=str(self.root),
+        )
+
+        packages = worker._detect_external_dependency_packages()
+
+        self.assertIn("requests", packages)
+        self.assertIn("rich", packages)
+        self.assertNotIn("tkinter", packages)
+        self.assertNotIn("pathlib", packages)
+
+    def test_dependency_workflow_removes_stdlib_from_existing_requirements(self):
+        (self.root / "main.py").write_text(
+            "import tkinter\nimport requests\nfrom rich.console import Console\nprint('ok')\n",
+            encoding="utf-8",
+        )
+        (self.root / "requirements.txt").write_text("tkinter\npathlib\nrequests\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай app с tkinter, requests и rich",
+            project_root=str(self.root),
+        )
+        worker._needs_confirmation = lambda tool, call=None: False
+
+        result = worker._sync_requirements_for_dependencies(["requests", "rich"])
+
+        self.assertTrue(result.ok, result.output)
+        requirements = (self.root / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("requests", requirements)
+        self.assertIn("rich", requirements)
+        self.assertNotIn("tkinter", requirements)
+        self.assertNotIn("pathlib", requirements)
+
+    def test_final_blocked_until_dependency_workflow_done(self):
+        state = AgentRunStateV3(run_id="r", user_message="u", resolved_task="create requests app")
+        state.file_goals = [FileGoal(path="main.py", status=FileGoalStatus.DONE)]
+        state.dependency_goals = ["requests"]
+        state.app_run_required = True
+
+        result = evaluate_final_readiness(state, TaskLedger())
+
+        self.assertFalse(result.allowed)
+        self.assertIn("pending dependency install", result.reason)
+        state.dependency_install_done = True
+        state.import_verification_done = True
+        state.app_run_done = True
+        result = evaluate_final_readiness(state, TaskLedger())
+        self.assertTrue(result.allowed)
+
+    def test_dependency_workflow_runs_install_import_verify_and_app(self):
+        (self.root / "main.py").write_text(
+            "import requests\nfrom rich.console import Console\n\nprint('app ok')\n",
+            encoding="utf-8",
+        )
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай app на requests/rich и проверь запуск",
+            project_root=str(self.root),
+        )
+        worker._needs_confirmation = lambda tool, call=None: False
+        worker._file_goals = [FileGoal(path="main.py", status=FileGoalStatus.DONE)]
+        commands: list[str] = []
+
+        def fake_run(command: str, transcript: list[str], *, timeout: int = 120):
+            commands.append(command)
+            return ToolResult(ok=True, output=f"$ {command}\nok\n[exit 0]", meta={"exit_code": 0})
+
+        worker._run_dependency_tool = fake_run
+        transcript: list[str] = []
+
+        self.assertTrue(worker._maybe_run_dependency_workflow(transcript))
+
+        self.assertTrue((self.root / "requirements.txt").exists())
+        requirements = (self.root / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("requests", requirements)
+        self.assertIn("rich", requirements)
+        self.assertTrue(any(" -m pip install -r requirements.txt" in command for command in commands))
+        self.assertTrue(any("import requests, rich" in command for command in commands))
+        self.assertEqual(commands[-1], worker._app_run_command())
+        self.assertTrue(worker._dependency_install_done)
+        self.assertTrue(worker._import_verification_done)
+        self.assertTrue(worker._app_run_done)
+
+    def test_missing_dependency_repair_adds_requirement_and_retries(self):
+        (self.root / "main.py").write_text("import httpx\nprint('ok')\n", encoding="utf-8")
+        (self.root / "requirements.txt").write_text("requests\n", encoding="utf-8")
+        worker = AgentWorker(
+            agent_profile(),
+            "Создай app и проверь зависимости",
+            project_root=str(self.root),
+        )
+        worker._needs_confirmation = lambda tool, call=None: False
+        worker._file_goals = [FileGoal(path="main.py", status=FileGoalStatus.DONE)]
+        worker._dependency_goals = ["requests"]
+        worker._detect_external_dependency_packages = lambda: ["requests"]
+
+        def fake_run(command: str, transcript: list[str], *, timeout: int = 120):
+            if command == worker._app_run_command():
+                return ToolResult(ok=False, output="ModuleNotFoundError: No module named 'httpx'")
+            return ToolResult(ok=True, output=f"$ {command}\nok\n[exit 0]", meta={"exit_code": 0})
+
+        worker._run_dependency_tool = fake_run
+        transcript: list[str] = []
+
+        worker._maybe_run_dependency_workflow(transcript)
+
+        self.assertIn("httpx", worker._dependency_goals)
+        self.assertFalse(worker._import_verification_done)
 
 
 if __name__ == "__main__":

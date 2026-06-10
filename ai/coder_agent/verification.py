@@ -31,6 +31,7 @@ class CommandGoal:
 def normalize_command(value: str) -> str:
     normalized = re.sub(r"[\"']", "", value or "").replace("\\", "/").strip().lower()
     normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"^[a-z]:/.*?/python(?:\.exe)?\s+", "python ", normalized)
     normalized = re.sub(r"^(py|py\.exe|python\.exe)\s+", "python ", normalized)
     normalized = normalized.replace("python ./", "python ")
     return normalized
@@ -111,6 +112,29 @@ def extract_command_goals(text: str) -> list[CommandGoal]:
             )
             if not already_covered:
                 goals.append(goal)
+    looks_like_version_fetch_demo_cli = (
+        ("cli" in normalized_text or "команд" in normalized_text or "commands" in normalized_text)
+        and "python" in normalized_text
+        and all(word in normalized_text for word in ("version", "fetch", "demo"))
+    )
+    if looks_like_version_fetch_demo_cli:
+        for raw in (
+            "python main.py version",
+            "python main.py demo",
+            "python main.py fetch",
+        ):
+            goal = CommandGoal(raw=raw, normalized=normalize_command(raw), mode="exact", source="inferred")
+            if goal.normalized not in {item.normalized for item in goals}:
+                goals.append(goal)
+    looks_like_run_then_repair = (
+        "main.py" in normalized_text
+        and any(word in normalized_text for word in ("запусти", "запуск", "run", "execute"))
+        and any(word in normalized_text for word in ("traceback", "ошиб", "найди ошиб", "исправ", "почини", "repair", "fix"))
+    )
+    if looks_like_run_then_repair:
+        goal = CommandGoal(raw="python main.py", normalized=normalize_command("python main.py"), mode="exact", source="inferred")
+        if goal.normalized not in {item.normalized for item in goals}:
+            goals.append(goal)
     looks_like_calculator_divide = (
         "divide" in normalized_text
         and ("calculator" in normalized_text or "калькулятор" in normalized_text)

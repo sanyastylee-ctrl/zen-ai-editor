@@ -5,7 +5,13 @@ from __future__ import annotations
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.profiles import AIProfile
-from core.research import ResearchPipeline, make_research_backend, render_citations
+from core.diagnostics import write_log
+from core.research import (
+    ResearchPipeline,
+    diagnose_research_backend,
+    render_citations,
+    select_research_backend,
+)
 
 
 class ResearchWorker(QThread):
@@ -28,10 +34,13 @@ class ResearchWorker(QThread):
         super().__init__(parent)
         self.profile = profile
         self.user_message = user_message
-        self.backend = backend or make_research_backend(
-            getattr(profile, "search_backend", "auto"),
-            getattr(profile, "searxng_url", ""),
-        )
+        backend_kind = getattr(profile, "search_backend", "auto")
+        searxng_url = getattr(profile, "searxng_url", "")
+        if backend is None:
+            self.backend, self.backend_status = select_research_backend(backend_kind, searxng_url)
+        else:
+            self.backend = backend
+            self.backend_status = diagnose_research_backend(backend_kind, searxng_url, backend=backend)
         self.confirmed_outbound = confirmed_outbound
         self._stop = False
         self.research_pending_confirmation = False
@@ -42,10 +51,29 @@ class ResearchWorker(QThread):
     def stop(self) -> None:
         self._stop = True
 
+    def _local_searcher_answer(self) -> str:
+        text = (self.user_message or "").lower()
+        if "rag" in text or "retrieval" in text:
+            return (
+                "Коротко:\n"
+                "- RAG — это подход, где модель сначала находит релевантные документы или фрагменты, "
+                "а потом отвечает с опорой на найденный контекст.\n"
+                "- Это помогает отвечать точнее по базе знаний, документации или проекту, не полагаясь "
+                "только на память модели.\n\n"
+                "Интернет-поиск здесь не нужен: вопрос про стабильное понятие."
+            )
+        return (
+            "Коротко:\n"
+            "- Этот вопрос похож на стабильный факт или объяснение, поэтому актуальный web-поиск не обязателен.\n"
+            "- Если тебе нужны свежие источники, добавь «найди», «актуальный» или «сейчас»."
+        )
+
     def run(self) -> None:
         try:
-            self.status.emit("Поисковик: проверяю, нужен ли интернет...")
-            pipeline = ResearchPipeline(self.backend)
+            self.status.emit(
+                f"Поисковик: backend {getattr(self.backend_status, 'effective_backend', getattr(self.backend, 'name', 'unknown'))}"
+            )
+            pipeline = ResearchPipeline(self.backend, backend_status=self.backend_status)
             result = pipeline.run(
                 self.user_message,
                 max_search_results=getattr(self.profile, "max_search_results", 5),
@@ -54,6 +82,8 @@ class ResearchWorker(QThread):
                 confirmed_outbound=self.confirmed_outbound,
             )
             self.last_result = result
+            if result.backend_status is None:
+                result.backend_status = self.backend_status
             if result.used_search or result.error:
                 self.sources_ready.emit([source.to_card() for source in result.ranked_sources])
             if self._stop:
@@ -69,7 +99,7 @@ class ResearchWorker(QThread):
                 }
                 self.confirmation_required.emit(self.research_confirmation_payload)
                 return
-            if result.used_search and result.sanitized_query:
+            if result.used_search and result.sanitized_query and len(result.sanitized_query.strip()) > 3:
                 self.chunk_received.emit(f"Поисковый запрос: {result.sanitized_query}\n\n")
             if result.error:
                 self.chunk_received.emit(f"{result.answer}\n")
@@ -79,9 +109,9 @@ class ResearchWorker(QThread):
                 if result.sources and "Источники:" not in result.answer:
                     self.chunk_received.emit("\n\n" + render_citations(result.sources))
                 return
-            self.chunk_received.emit(
-                "Этот запрос не требует актуального интернет-поиска. "
-                "Отвечу через обычную модель Поисковика.\n"
-            )
+            # Запрос не требует поиска (стабильный факт, объяснение)
+            # НЕ говорим "ищи сам" — просто честно отвечаем что поиск не нужен
+            write_log("[searcher_route_local_answer]")
+            self.chunk_received.emit(self._local_searcher_answer() + "\n")
         finally:
             self.finished_signal.emit()
