@@ -1259,6 +1259,30 @@ Tool result for read_file:
         self.assertEqual(started["code_context"], "project tree")
         self.assertTrue(window.worker.started)
 
+    def test_main_window_agent_finished_uses_snapshot_without_payload_vars(self):
+        from ui.main_window import ZenEditor
+
+        (self.root / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+
+        window = ZenEditor.__new__(ZenEditor)
+        window.agent_progress = mock.Mock()
+        window.projects = mock.Mock(current=str(self.root))
+        window._tool_path_to_project_file = lambda path: str(self.root / path)
+        window._open_path_in_editor = mock.Mock()
+
+        snapshot = {
+            "run_id": "abc123",
+            "changed_files": ["hello.py"],
+            "verified_files": ["hello.py"],
+            "current_tool": "write_file",
+            "current_command": "",
+        }
+
+        ZenEditor._on_agent_finished(window, snapshot)
+
+        window.agent_progress.set_finished.assert_called_once_with(snapshot)
+        window._open_path_in_editor.assert_called_once()
+
     def test_send_text_triggers_route_log_and_enqueue(self):
         from ui.main_window import ZenEditor
 

@@ -1778,12 +1778,18 @@ class ZenEditor(QMainWindow):
     def _on_agent_finished(self, snapshot: dict) -> None:
         if hasattr(self, "agent_progress"):
             self.agent_progress.set_finished(snapshot)
-        args = payload.get("args", {}) if isinstance(payload.get("args", {}), dict) else {}
-        tool_path = str(args.get("path") or meta.get("path") or "")
-        if ok and name in {"read_file", "write_file", "edit_file", "apply_patch"} and tool_path:
-            file_path = self._tool_path_to_project_file(tool_path)
+        changed_files = [
+            str(path)
+            for path in (snapshot.get("changed_files") or [])
+            if str(path).strip()
+        ]
+        if changed_files:
+            file_path = self._tool_path_to_project_file(changed_files[0])
             if file_path and os.path.isfile(file_path):
-                self._open_path_in_editor(file_path, f"{name}: {os.path.basename(file_path)}")
+                self._open_path_in_editor(
+                    file_path,
+                    f"Изменён {os.path.basename(file_path)}",
+                )
 
     def _on_agent_confirmation_requested(self, payload: dict) -> None:
         name = payload.get("name", "")
@@ -1859,6 +1865,41 @@ class ZenEditor(QMainWindow):
         self._render_research_sources(safe_sources)
         if self._active_profile() and self._active_profile().kind == ProfileKind.RESEARCHER:
             self._show_workspace("sources", f"{len(safe_sources)} источников")
+
+    def _cleanup_before_exit(self) -> None:
+        write_log("[app_about_to_quit]")
+        try:
+            self.stop_generation()
+        except Exception as exc:
+            write_log(f'[qt_thread_cleanup_error] worker_stop="{self._quote_log(str(exc))}"')
+        worker = self.worker
+        if worker is not None and hasattr(worker, "isRunning") and worker.isRunning():
+            try:
+                if hasattr(worker, "wait"):
+                    worker.wait(5000)
+            except Exception as exc:
+                write_log(f'[qt_thread_cleanup_error] worker_wait="{self._quote_log(str(exc))}"')
+        sandbox_worker = getattr(self.sandbox, "_worker", None)
+        if sandbox_worker is not None and hasattr(sandbox_worker, "isRunning") and sandbox_worker.isRunning():
+            try:
+                self.sandbox.kill_process()
+                sandbox_worker.wait(5000)
+            except Exception as exc:
+                write_log(f'[qt_thread_cleanup_error] sandbox_wait="{self._quote_log(str(exc))}"')
+        rag_worker = getattr(self, "_rag_worker", None)
+        if rag_worker is not None and hasattr(rag_worker, "isRunning") and rag_worker.isRunning():
+            try:
+                rag_worker.wait(5000)
+            except Exception as exc:
+                write_log(f'[qt_thread_cleanup_error] rag_wait="{self._quote_log(str(exc))}"')
+        try:
+            ModelManager.instance().unload_all()
+        except Exception as exc:
+            write_log(f'[qt_thread_cleanup_error] model_unload="{self._quote_log(str(exc))}"')
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        self._cleanup_before_exit()
+        super().closeEvent(event)
 
     def _on_chunk(self, chunk: str) -> None:
         self._current_ai_response += chunk
