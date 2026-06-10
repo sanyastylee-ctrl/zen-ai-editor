@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2306,6 +2307,20 @@ Tool result for read_file:
         self.assertFalse(worker._needs_confirmation(worker._tools["run_terminal"], safe))
         self.assertTrue(worker._needs_confirmation(worker._tools["run_terminal"], install))
         self.assertFalse(worker._needs_confirmation(worker._tools["write_file"]))
+
+    def test_packaged_agent_uses_python_command_not_zenai_exe_for_project_commands(self):
+        with mock.patch("ai.agent.sys.executable", r"D:\Zen Ai Editor\dist\ZenAI\ZenAI.exe"), \
+             mock.patch.object(sys, "frozen", True, create=True):
+            worker = AgentWorker(
+                agent_profile(),
+                "создай проект и проверь python main.py",
+                project_root=str(self.root),
+                confirmation_policy="auto_confirm",
+            )
+
+        self.assertEqual(worker._python_cmd, "python")
+        self.assertEqual(worker._app_run_command(), "python main.py")
+        self.assertEqual(worker._pip_install_cmd, "")
 
     def test_safe_python_command_runs(self):
         (self.root / "hello.py").write_text("print('safe-ok')\n", encoding="utf-8")

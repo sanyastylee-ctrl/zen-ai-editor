@@ -3025,6 +3025,11 @@ class AgentWorker(QThread):
         return text
 
     def _default_python_cmd(self) -> str:
+        if getattr(sys, "frozen", False):
+            # In PyInstaller builds sys.executable is ZenAI.exe, not a Python
+            # interpreter. Project verification/dependency commands must use a
+            # real Python command available to the terminal.
+            return "python"
         executable = sys.executable or "python"
         if executable and os.path.exists(executable):
             return self._quote_command_arg(executable)
