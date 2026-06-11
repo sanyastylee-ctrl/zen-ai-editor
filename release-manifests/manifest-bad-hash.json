@@ -6,7 +6,7 @@
   "min_supported_version": "0.1.0",
   "update_url": "https://github.com/sanyastylee-ctrl/zen-ai-editor/releases/download/v0.1.1-github-updater-rc-20260611/ZenAI-v0.1.1-github-new-win64-update.zip",
   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "size": 554727336,
+  "size": 554732796,
   "release_notes": [
     "GitHub hosted updater smoke."
   ],
