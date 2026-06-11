@@ -1,0 +1,145 @@
+name: ZenAI GitHub Updater RC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/github-release-flow
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    runs-on: windows-latest
+    env:
+      TAG: v0.1.1-github-updater-rc-20260611
+      VERSION: 0.1.1-github-new
+      CHANNEL: dev
+      BUILD_ID: github-updater-rc-20260611
+      ZIP_NAME: ZenAI-v0.1.1-github-new-win64-update.zip
+      UNSAFE_ZIP_NAME: ZenAI-v0.1.1-github-unsafe-win64-update.zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          architecture: x64
+
+      - name: Install build deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build safe release zip
+        shell: pwsh
+        run: |
+          python scripts/build_release.py --zip $env:ZIP_NAME
+
+      - name: Stamp version metadata into release zip
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist\ZenAI'
+          $versionPath = Join-Path $dist 'version.json'
+          $versionJson = @{
+            version = $env:VERSION
+            channel = $env:CHANNEL
+            build_id = $env:BUILD_ID
+            git_commit = "${{ github.sha }}"
+            build_date = (Get-Date -Format 'yyyy-MM-dd')
+          } | ConvertTo-Json -Depth 4
+          Set-Content -Path $versionPath -Value $versionJson -Encoding utf8
+
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE $env:ZIP_NAME
+          $tmp = Join-Path $env:RUNNER_TEMP 'zenai-release-repack'
+          if (Test-Path $tmp) {
+            Remove-Item $tmp -Recurse -Force
+          }
+          Expand-Archive -Path $zipPath -DestinationPath $tmp
+          Copy-Item -Path $versionPath -Destination (Join-Path $tmp 'version.json') -Force
+          Remove-Item $zipPath -Force
+          Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zipPath -Force
+
+      - name: Create unsafe release zip
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $unsafePath = Join-Path $env:GITHUB_WORKSPACE $env:UNSAFE_ZIP_NAME
+          if (Test-Path $unsafePath) {
+            Remove-Item $unsafePath -Force
+          }
+          $fs = [System.IO.File]::Open($unsafePath, [System.IO.FileMode]::CreateNew)
+          try {
+            $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+              $evilEntry = $zip.CreateEntry('../evil.txt', [System.IO.Compression.CompressionLevel]::Optimal)
+              $writer = New-Object System.IO.StreamWriter($evilEntry.Open())
+              try {
+                $writer.Write('evil')
+              }
+              finally {
+                $writer.Dispose()
+              }
+
+              $versionEntry = $zip.CreateEntry('version.json', [System.IO.Compression.CompressionLevel]::Optimal)
+              $versionJson = @{
+                version = $env:VERSION
+                channel = $env:CHANNEL
+                build_id = $env:BUILD_ID
+                git_commit = "${{ github.sha }}"
+                build_date = (Get-Date -Format 'yyyy-MM-dd')
+              } | ConvertTo-Json -Depth 4
+              $versionWriter = New-Object System.IO.StreamWriter($versionEntry.Open())
+              try {
+                $versionWriter.Write($versionJson)
+              }
+              finally {
+                $versionWriter.Dispose()
+              }
+            }
+            finally {
+              $zip.Dispose()
+            }
+          }
+          finally {
+            $fs.Dispose()
+          }
+
+      - name: Generate manifests
+        shell: pwsh
+        run: |
+          $safeUrl = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$env:ZIP_NAME"
+          $unsafeUrl = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$env:UNSAFE_ZIP_NAME"
+
+          python scripts/make_update_manifest.py --zip $env:ZIP_NAME --url $safeUrl --version $env:VERSION --channel $env:CHANNEL --out manifest-good.json --note "GitHub hosted updater smoke."
+          python scripts/make_update_manifest.py --zip $env:UNSAFE_ZIP_NAME --url $unsafeUrl --version $env:VERSION --channel $env:CHANNEL --out manifest-unsafe.json --note "Unsafe package smoke."
+
+          python -c "import json, pathlib; p = pathlib.Path('manifest-good.json'); m = json.loads(p.read_text(encoding='utf-8')); m['sha256'] = '0' * 64; pathlib.Path('manifest-bad-hash.json').write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')"
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.TAG }}
+          name: ZenAI GitHub Updater RC 2026-06-11
+          prerelease: true
+          draft: false
+          body: |
+            Hosted updater RC for release-flow smoke.
+
+            Assets:
+            - Safe update zip
+            - Unsafe update zip
+            - Good manifest
+            - Bad-hash manifest
+            - Unsafe manifest
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.UNSAFE_ZIP_NAME }}
+            manifest-good.json
+            manifest-bad-hash.json
+            manifest-unsafe.json
