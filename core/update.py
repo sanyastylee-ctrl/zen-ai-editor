@@ -257,7 +257,7 @@ def inspect_update_zip(package_path: Path, *, allow_model_update: bool = False) 
                     raise UpdateError("Update zip contains a symlink.")
                 lower_parts = [part.lower() for part in parts]
                 if (not allow_model_update) and (
-                    "models" in lower_parts or name.lower().endswith(".gguf")
+                    (lower_parts and lower_parts[0] == "models") or name.lower().endswith(".gguf")
                 ):
                     raise UpdateError("Update zip must not contain models or GGUF files.")
                 total_size += int(info.file_size)
@@ -400,6 +400,8 @@ def apply_update_package(
         backup_created = True
         _write_update_log(log_path, "replacing files")
         _remove_replaceable_install_files(install_dir)
+        if os.getenv("ZENAI_UPDATER_TEST_FAIL_AFTER_REMOVE") == "1":
+            raise UpdateError("Simulated updater failure after removing replaceable files.")
         _copy_payload_to_install(payload_dir, install_dir)
         relaunched = False
         if relaunch:

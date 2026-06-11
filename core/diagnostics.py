@@ -8,6 +8,7 @@ from typing import Any
 
 from . import app_data
 from .paths import get_models_dir
+from .version import APP_CHANNEL, APP_VERSION, BUILD_ID, GIT_COMMIT
 
 
 GPU_BACKEND_HINTS = ("cuda", "vulkan", "kompute", "clblast", "hip", "rocm", "metal")
@@ -65,6 +66,10 @@ def log_runtime_diagnostics(
         "exe": str(Path(sys.executable).resolve()),
         "cwd": os.getcwd(),
         "models_dir": str(get_models_dir()),
+        "app_version": APP_VERSION,
+        "app_channel": APP_CHANNEL,
+        "build_id": BUILD_ID,
+        "git_commit": GIT_COMMIT,
         "model_file": getattr(profile, "model_file", ""),
         "model_path": model_path,
         "profile_id": getattr(profile, "id", ""),

@@ -133,6 +133,11 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(update.UpdateError):
             update.inspect_update_zip(package)
 
+    def test_internal_library_models_package_allowed(self):
+        package = self.make_zip(files={"ZenAI.exe": "x", "_internal/transformers/models/__init__.py": ""})
+        names = update.inspect_update_zip(package)
+        self.assertIn("_internal/transformers/models/__init__.py", names)
+
     def test_valid_zip_accepted(self):
         package = self.make_zip()
         names = update.inspect_update_zip(package)
@@ -173,6 +178,21 @@ class UpdaterTests(unittest.TestCase):
                     relaunch=False,
                 )
         self.assertEqual((install / "ZenAI.exe").read_text(encoding="utf-8"), "old exe")
+        self.assertEqual((install / "models" / "local.gguf").read_text(encoding="utf-8"), "model bytes")
+
+    def test_env_failpoint_after_remove_rolls_back(self):
+        install = self.make_install()
+        package = self.make_zip(files={"ZenAI.exe": "new exe", "_internal/runtime.txt": "new runtime"})
+        with mock.patch.dict("os.environ", {"ZENAI_UPDATER_TEST_FAIL_AFTER_REMOVE": "1"}):
+            with self.assertRaises(update.UpdateError):
+                update.apply_update_package(
+                    install_dir=install,
+                    package_path=package,
+                    expected_sha256=_sha(package),
+                    relaunch=False,
+                )
+        self.assertEqual((install / "ZenAI.exe").read_text(encoding="utf-8"), "old exe")
+        self.assertEqual((install / "_internal" / "runtime.txt").read_text(encoding="utf-8"), "old runtime")
         self.assertEqual((install / "models" / "local.gguf").read_text(encoding="utf-8"), "model bytes")
 
     def test_bad_hash_after_success_does_not_reuse_old_backup_for_rollback(self):

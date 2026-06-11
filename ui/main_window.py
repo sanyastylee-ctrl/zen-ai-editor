@@ -19,6 +19,7 @@ import html
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +78,10 @@ class ZenEditor(QMainWindow):
         self.setWindowTitle("Zen AI Editor")
         self.resize(1400, 900)
         self.setMinimumSize(900, 600)
+        write_log(
+            f'[app_version] version="{self._quote_log(APP_VERSION)}" '
+            f'channel="{self._quote_log(APP_CHANNEL)}"'
+        )
 
         # ---------- стейт ----------
         self.pm = ProfileManager()
@@ -2618,8 +2623,17 @@ class ZenEditor(QMainWindow):
             updater_exe = install_dir / "ZenAIUpdater.exe"
             if not updater_exe.exists():
                 raise UpdateError("ZenAIUpdater.exe не найден рядом с ZenAI.exe. Обновление не установлено.")
+            cached_updater_dir = package_path.parent / f"ZenAIUpdater-{os.getpid()}"
+            if cached_updater_dir.exists():
+                shutil.rmtree(cached_updater_dir)
+            cached_updater_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(updater_exe, cached_updater_dir / updater_exe.name)
+            updater_internal = updater_exe.parent / "_internal"
+            if updater_internal.exists():
+                shutil.copytree(updater_internal, cached_updater_dir / "_internal")
+            cached_updater = cached_updater_dir / updater_exe.name
             cmd = build_updater_command(
-                updater_exe=updater_exe,
+                updater_exe=cached_updater,
                 install_dir=install_dir,
                 package_path=package_path,
                 expected_sha256=manifest.sha256,
@@ -2627,7 +2641,10 @@ class ZenEditor(QMainWindow):
                 pid=os.getpid(),
                 relaunch=True,
             )
-            write_log(f'[update_updater_launch] package="{self._quote_log(str(package_path))}"')
+            write_log(
+                f'[update_updater_launch] package="{self._quote_log(str(package_path))}" '
+                f'updater="{self._quote_log(str(cached_updater))}"'
+            )
             subprocess.Popen(cmd, cwd=str(install_dir))
             QApplication.quit()
         except UpdateError as exc:
