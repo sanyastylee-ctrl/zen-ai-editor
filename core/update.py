@@ -6,9 +6,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import ssl
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -110,6 +113,34 @@ def _validate_update_url(url: str) -> None:
         raise UpdateError("Update URL is missing a host.")
 
 
+def _sanitize_diagnostic_text(text: Any, *, limit: int = 240) -> str:
+    clean = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or ""))
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:limit]
+
+
+def _has_exception_type(exc: BaseException, kind: type[BaseException]) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, kind):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _exception_chain_type(exc: BaseException) -> str:
+    names: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        names.append(type(current).__name__)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return "->".join(names)
+
+
 def parse_manifest(data: str | bytes | dict[str, Any], *, current_version: str | None = None, channel: str | None = None) -> UpdateManifest:
     raw: dict[str, Any]
     if isinstance(data, dict):
@@ -165,25 +196,97 @@ def parse_manifest(data: str | bytes | dict[str, Any], *, current_version: str |
     )
 
 
-def fetch_manifest(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
+def fetch_manifest(
+    url: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    diagnostics: dict[str, Any] | None = None,
+) -> str:
     _validate_update_url(url)
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "manifest_url": url,
+                "request_start": True,
+                "timeout_seconds": timeout,
+            }
+        )
     request = urllib.request.Request(url, headers={"User-Agent": "ZenAI-Updater"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read(256 * 1024).decode("utf-8", errors="replace")
-    except OSError as exc:
+            body = response.read(256 * 1024)
+            text = body.decode("utf-8", errors="replace")
+            if diagnostics is not None:
+                diagnostics.update(
+                    {
+                        "request_done": True,
+                        "http_status": getattr(response, "status", None) or response.getcode(),
+                        "content_type": response.headers.get("content-type", ""),
+                        "response_size": len(body),
+                    }
+                )
+            return text
+    except (OSError, urllib.error.URLError) as exc:
+        if diagnostics is not None:
+            diagnostics.update(
+                {
+                    "request_done": False,
+                    "exception_type": _exception_chain_type(exc),
+                    "exception_message": _sanitize_diagnostic_text(exc),
+                    "ssl_error": _has_exception_type(exc, ssl.SSLError),
+                    "timeout": _has_exception_type(exc, TimeoutError)
+                    or _has_exception_type(exc, socket.timeout),
+                }
+            )
         raise UpdateError("Не удалось проверить обновления.") from exc
 
 
-def check_for_update(manifest_url: str, *, current_version: str | None = None, channel: str | None = None) -> UpdateCheckResult:
+def check_for_update(
+    manifest_url: str,
+    *,
+    current_version: str | None = None,
+    channel: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> UpdateCheckResult:
+    current_version = current_version or APP_VERSION
+    channel = channel or APP_CHANNEL
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "manifest_url": manifest_url,
+                "current_version": current_version,
+                "current_channel": channel,
+                "manifest_parse_ok": False,
+            }
+        )
+    manifest_text = ""
     try:
-        manifest_text = fetch_manifest(manifest_url)
+        manifest_text = fetch_manifest(manifest_url, diagnostics=diagnostics)
         manifest = parse_manifest(manifest_text, current_version=current_version, channel=channel)
     except UpdateError as exc:
+        if diagnostics is not None and manifest_text:
+            diagnostics.update(
+                {
+                    "manifest_parse_ok": False,
+                    "parse_exception_type": type(exc).__name__,
+                    "parse_exception_message": _sanitize_diagnostic_text(exc),
+                    "first_120_chars_sanitized": _sanitize_diagnostic_text(manifest_text, limit=120),
+                }
+            )
         if "No newer version" in str(exc):
-            return UpdateCheckResult(False, current_version or APP_VERSION, message="У вас последняя версия.")
+            return UpdateCheckResult(False, current_version, message="У вас последняя версия.")
         raise
-    return UpdateCheckResult(True, current_version or APP_VERSION, manifest=manifest, message="Доступно обновление.")
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "manifest_parse_ok": True,
+                "latest_version": manifest.latest_version,
+                "update_url": manifest.update_url,
+                "sha256": manifest.sha256,
+                "size": manifest.size,
+            }
+        )
+    return UpdateCheckResult(True, current_version, manifest=manifest, message="Доступно обновление.")
 
 
 def sha256_file(path: Path) -> str:

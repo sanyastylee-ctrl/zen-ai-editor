@@ -2581,14 +2581,35 @@ class ZenEditor(QMainWindow):
                 "URL манифеста обновлений не настроен.\nОткройте настройки и укажите update manifest URL.",
             )
             return
-        write_log("[update_check_start]")
+        current_channel = str(self.app_settings.get("update_channel", APP_CHANNEL) or APP_CHANNEL)
+        update_diagnostics: dict[str, object] = {}
+        write_log(
+            f'[update_check_start] url="{self._quote_log(manifest_url)}" '
+            f'current_version="{self._quote_log(APP_VERSION)}" '
+            f'current_channel="{self._quote_log(current_channel)}"'
+        )
         try:
             result = check_for_update(
                 manifest_url,
                 current_version=APP_VERSION,
-                channel=str(self.app_settings.get("update_channel", APP_CHANNEL) or APP_CHANNEL),
+                channel=current_channel,
+                diagnostics=update_diagnostics,
             )
         except UpdateError as exc:
+            if update_diagnostics.get("request_done") is False:
+                write_log(
+                    f'[update_manifest_fetch_failed] '
+                    f'type="{self._quote_log(str(update_diagnostics.get("exception_type", "")))}" '
+                    f'message="{self._quote_log(str(update_diagnostics.get("exception_message", "")))}" '
+                    f'ssl_error="{str(bool(update_diagnostics.get("ssl_error"))).lower()}" '
+                    f'timeout="{str(bool(update_diagnostics.get("timeout"))).lower()}"'
+                )
+            elif update_diagnostics.get("response_size") is not None:
+                write_log(
+                    f'[update_manifest_parse_failed] '
+                    f'type="{self._quote_log(str(update_diagnostics.get("parse_exception_type", type(exc).__name__)))}" '
+                    f'preview="{self._quote_log(str(update_diagnostics.get("first_120_chars_sanitized", "")))}"'
+                )
             write_log(f'[update_check_failed] reason="{self._quote_log(str(exc))}"')
             QMessageBox.warning(self, "Обновления", str(exc))
             return
@@ -2599,6 +2620,22 @@ class ZenEditor(QMainWindow):
             return
 
         manifest = result.manifest
+        write_log(
+            f'[update_manifest_fetch_ok] '
+            f'status="{self._quote_log(str(update_diagnostics.get("http_status", "")))}" '
+            f'content_type="{self._quote_log(str(update_diagnostics.get("content_type", "")))}" '
+            f'bytes="{self._quote_log(str(update_diagnostics.get("response_size", "")))}"'
+        )
+        write_log(
+            f'[update_manifest_parsed] latest="{self._quote_log(manifest.latest_version)}" '
+            f'url="{self._quote_log(manifest.update_url)}" '
+            f'sha256="{self._quote_log(manifest.sha256)}" '
+            f'size="{manifest.size}"'
+        )
+        write_log(
+            f'[update_available] current="{self._quote_log(result.current_version)}" '
+            f'latest="{self._quote_log(manifest.latest_version)}"'
+        )
         notes = "\n".join(f"• {note}" for note in manifest.release_notes[:8]) or "• Без описания изменений"
         answer = QMessageBox.question(
             self,

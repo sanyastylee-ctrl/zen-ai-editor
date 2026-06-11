@@ -260,6 +260,34 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(result.manifest.latest_version if result.manifest else "", "0.1.1")
         self.assertEqual(result.manifest.release_notes if result.manifest else [], ["Исправлен Кодер"])
 
+    def test_update_check_records_fetch_and_parse_diagnostics(self):
+        diagnostics: dict[str, object] = {}
+        with mock.patch("core.update.fetch_manifest", return_value=__import__("json").dumps(self.manifest())) as mocked:
+            result = update.check_for_update(
+                "https://example.com/manifest.json",
+                current_version="0.1.0",
+                channel="dev",
+                diagnostics=diagnostics,
+            )
+        self.assertTrue(result.available)
+        mocked.assert_called_once()
+        self.assertEqual(diagnostics["manifest_url"], "https://example.com/manifest.json")
+        self.assertEqual(diagnostics["current_version"], "0.1.0")
+        self.assertEqual(diagnostics["current_channel"], "dev")
+        self.assertTrue(diagnostics["manifest_parse_ok"])
+        self.assertEqual(diagnostics["latest_version"], "0.1.1")
+        self.assertEqual(diagnostics["sha256"], "a" * 64)
+
+    def test_fetch_manifest_records_failure_diagnostics(self):
+        diagnostics: dict[str, object] = {}
+        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("network timeout")):
+            with self.assertRaises(update.UpdateError):
+                update.fetch_manifest("https://example.com/manifest.json", diagnostics=diagnostics)
+        self.assertEqual(diagnostics["manifest_url"], "https://example.com/manifest.json")
+        self.assertFalse(diagnostics["request_done"])
+        self.assertIn("TimeoutError", str(diagnostics["exception_type"]))
+        self.assertTrue(diagnostics["timeout"])
+
 
 if __name__ == "__main__":
     unittest.main()
