@@ -19,7 +19,9 @@ import html
 import hashlib
 import os
 import re
+import subprocess
 import sys
+from pathlib import Path
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QTimer
@@ -40,6 +42,13 @@ from core.settings import PersistentSettings
 from core.chat_store import ChatSessionStore
 from core.companion import CompanionMemoryStore, extract_explicit_memory
 from core.diagnostics import write_log
+from core.update import (
+    UpdateError,
+    build_updater_command,
+    check_for_update,
+    prepare_update_package,
+)
+from core.version import APP_CHANNEL, APP_VERSION
 from ai.agent import AgentWorker, sanitize_agent_history
 from ai.research import ResearchWorker
 from ai.vision import VisionWorker
@@ -81,6 +90,10 @@ class ZenEditor(QMainWindow):
             "use_rag": False,
             "diff_before_apply": True,
             "agent_confirmation_policy": "confirm_changes",
+            "update_channel": APP_CHANNEL,
+            "update_manifest_url": "",
+            "auto_check_updates": False,
+            "last_update_check": "",
         }
         saved_settings = PersistentSettings.load()
         for key in self.app_settings:
@@ -280,6 +293,13 @@ class ZenEditor(QMainWindow):
         self.profile_switcher = ProfileSwitcher()
         self.profile_switcher.profile_changed.connect(self._on_profile_changed)
         top_bar.addWidget(self.profile_switcher)
+
+        self.update_btn = QPushButton("↻")
+        self.update_btn.setObjectName("secondary")
+        self.update_btn.setFixedWidth(36)
+        self.update_btn.setToolTip(f"Проверить обновления\nВерсия: {APP_VERSION} ({APP_CHANNEL})")
+        self.update_btn.clicked.connect(self.check_for_updates)
+        top_bar.addWidget(self.update_btn)
 
         self.settings_btn = QPushButton("⚙")
         self.settings_btn.setObjectName("secondary")
@@ -2546,6 +2566,73 @@ class ZenEditor(QMainWindow):
                 current = visible[0].id if visible else None
             self.profile_switcher.set_profiles(self._main_switcher_profiles(), current)
             self._update_token_bar()
+
+    def check_for_updates(self) -> None:
+        manifest_url = str(self.app_settings.get("update_manifest_url", "") or "").strip()
+        if not manifest_url:
+            QMessageBox.information(
+                self,
+                "Обновления",
+                "URL манифеста обновлений не настроен.\nОткройте настройки и укажите update manifest URL.",
+            )
+            return
+        write_log("[update_check_start]")
+        try:
+            result = check_for_update(
+                manifest_url,
+                current_version=APP_VERSION,
+                channel=str(self.app_settings.get("update_channel", APP_CHANNEL) or APP_CHANNEL),
+            )
+        except UpdateError as exc:
+            write_log(f'[update_check_failed] reason="{self._quote_log(str(exc))}"')
+            QMessageBox.warning(self, "Обновления", str(exc))
+            return
+
+        if not result.available or result.manifest is None:
+            write_log("[update_check_done] available=false")
+            QMessageBox.information(self, "Обновления", result.message or "У вас последняя версия.")
+            return
+
+        manifest = result.manifest
+        notes = "\n".join(f"• {note}" for note in manifest.release_notes[:8]) or "• Без описания изменений"
+        answer = QMessageBox.question(
+            self,
+            "Доступно обновление",
+            (
+                f"Текущая версия: {APP_VERSION}\n"
+                f"Новая версия: {manifest.latest_version}\n"
+                f"Размер: {manifest.size} байт\n\n"
+                f"{notes}\n\n"
+                "Скачать, проверить и установить обновление?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            write_log("[update_install_cancelled]")
+            return
+
+        try:
+            package_path = prepare_update_package(manifest)
+            install_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd()
+            updater_exe = install_dir / "ZenAIUpdater.exe"
+            if not updater_exe.exists():
+                raise UpdateError("ZenAIUpdater.exe не найден рядом с ZenAI.exe. Обновление не установлено.")
+            cmd = build_updater_command(
+                updater_exe=updater_exe,
+                install_dir=install_dir,
+                package_path=package_path,
+                expected_sha256=manifest.sha256,
+                app_exe=Path(sys.executable).name if getattr(sys, "frozen", False) else "ZenAI.exe",
+                pid=os.getpid(),
+                relaunch=True,
+            )
+            write_log(f'[update_updater_launch] package="{self._quote_log(str(package_path))}"')
+            subprocess.Popen(cmd, cwd=str(install_dir))
+            QApplication.quit()
+        except UpdateError as exc:
+            write_log(f'[update_prepare_failed] reason="{self._quote_log(str(exc))}"')
+            QMessageBox.warning(self, "Обновления", str(exc))
 
     def toggle_sidebar(self) -> None:
         self.sidebar.setVisible(not self.sidebar.isVisible())

@@ -22,7 +22,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QLabel,
     QStackedWidget, QInputDialog, QMessageBox, QComboBox, QCheckBox,
-    QSpinBox, QFormLayout, QGroupBox, QWidget,
+    QSpinBox, QFormLayout, QGroupBox, QWidget, QLineEdit,
 )
 
 from core.profiles import (
@@ -163,6 +163,33 @@ class SettingsDialog(QDialog):
         agent_row.addWidget(self.agent_policy_combo)
         agent_row.addStretch()
         layout.addLayout(agent_row)
+
+        update_row = QHBoxLayout()
+        update_row.setSpacing(10)
+        update_label = QLabel("Updates:")
+        update_label.setStyleSheet(f"color:{Palette.TEXT_SECONDARY}; font-size:12px;")
+        update_row.addWidget(update_label)
+
+        self.update_channel_combo = QComboBox()
+        self.update_channel_combo.setObjectName("compact_combo")
+        self.update_channel_combo.addItem("dev", "dev")
+        self.update_channel_combo.addItem("stable", "stable")
+        channel = self.app_settings.get("update_channel", "dev")
+        channel_idx = self.update_channel_combo.findData(channel)
+        if channel_idx >= 0:
+            self.update_channel_combo.setCurrentIndex(channel_idx)
+        update_row.addWidget(self.update_channel_combo)
+
+        self.update_url_edit = QLineEdit()
+        self.update_url_edit.setObjectName("settingsLineEdit")
+        self.update_url_edit.setPlaceholderText("https://example.com/zenai/update-manifest.json")
+        self.update_url_edit.setText(str(self.app_settings.get("update_manifest_url", "") or ""))
+        update_row.addWidget(self.update_url_edit, 1)
+
+        self.auto_update_check = QCheckBox("Проверять при запуске")
+        self.auto_update_check.setChecked(bool(self.app_settings.get("auto_check_updates", False)))
+        update_row.addWidget(self.auto_update_check)
+        layout.addLayout(update_row)
 
         return wrap
 
@@ -362,6 +389,9 @@ class SettingsDialog(QDialog):
         self.app_settings["use_rag"] = self.rag_check.isChecked()
         self.app_settings["diff_before_apply"] = self.diff_check.isChecked()
         self.app_settings["agent_confirmation_policy"] = self.agent_policy_combo.currentData()
+        self.app_settings["update_channel"] = self.update_channel_combo.currentData()
+        self.app_settings["update_manifest_url"] = self.update_url_edit.text().strip()
+        self.app_settings["auto_check_updates"] = self.auto_update_check.isChecked()
 
         self.accept()
 

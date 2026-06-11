@@ -87,11 +87,87 @@ PyInstaller `onefile` is not the recommended release format right now because:
 
 `onedir` is the safer release format until the runtime behavior is stable across more user machines.
 
-## Future Option
+## Built-in Updater Architecture
 
-A built-in updater can be added later.
+ZenAI uses a two-process updater model:
 
-Possible future flow:
+```text
+ZenAI.exe
+  checks a signed-by-hash JSON manifest
+  downloads an update zip to %APPDATA%\ZenAI\updates
+  verifies sha256
+  launches ZenAIUpdater.exe
+  exits
+
+ZenAIUpdater.exe
+  waits for ZenAI.exe to close
+  verifies sha256 again
+  validates zip paths
+  backs up the current install
+  replaces app files
+  preserves models/
+  relaunches ZenAI.exe
+  rolls back on failure
+```
+
+The running `ZenAI.exe` must never overwrite itself or bundled DLLs.
+
+## Manifest Format
+
+Release manifests are JSON:
+
+```json
+{
+  "app": "ZenAI",
+  "channel": "stable",
+  "latest_version": "0.1.1",
+  "published_at": "2026-06-10T20:00:00Z",
+  "min_supported_version": "0.1.0",
+  "update_url": "https://example.com/ZenAI-v0.1.1-win64-update.zip",
+  "sha256": "64_hex_characters",
+  "size": 123456789,
+  "release_notes": ["Исправлен Кодер"],
+  "requires_full_update": true,
+  "critical": false
+}
+```
+
+The app accepts only `http` and `https` update URLs. `file://` and local paths
+are rejected for product update manifests.
+
+## Updater Safety Rules
+
+- Every update zip is verified by sha256 before install.
+- Zip entries with absolute paths, drive-letter paths, `..`, symlinks, `models/`,
+  or `.gguf` files are rejected.
+- `%APPDATA%\ZenAI` is not part of the install directory and is never modified by
+  updater replacement.
+- `ZenAI\models` is preserved and excluded from backups/replacement.
+- On failure, the updater restores the previous install files from backup.
+- Backups are install-folder siblings named `ZenAI_backup_<timestamp>`.
+
+## Release Build Helpers
+
+Use:
+
+```powershell
+python scripts/build_release.py
+python scripts/make_update_manifest.py --zip ZenAI-portable-win64.zip --url https://... --version 0.1.1 --channel stable
+```
+
+`scripts/build_release.py` builds `ZenAIUpdater.exe`, then `ZenAI.exe`, copies
+the updater next to the main executable, and creates the portable zip.
+
+## Future Config-only Updates
+
+Future lightweight packages can update prompts, style/config, profile defaults,
+or a model catalog without replacing the full app. They should use a separate
+manifest type and must not be mixed into full binary updates until the policy is
+specified and tested.
+
+## Legacy Manual Update Flow
+
+Manual replacement remains supported:
 
 1. App checks release metadata.
 2. User confirms update.

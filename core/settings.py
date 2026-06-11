@@ -16,6 +16,10 @@ class PersistentSettings:
         'temperature': 0.7, 'max_tokens': 2048, 'n_ctx': 4096,
         'diff_before_apply': True, 'use_rag': False,
         'agent_confirmation_policy': 'confirm_changes',
+        'update_channel': 'dev',
+        'update_manifest_url': '',
+        'auto_check_updates': False,
+        'last_update_check': '',
         'comfyui_enabled': False, 'comfyui_url': 'http://127.0.0.1:8188',
         'comfyui_steps': 20, 'comfyui_cfg': 7.0,
     }
