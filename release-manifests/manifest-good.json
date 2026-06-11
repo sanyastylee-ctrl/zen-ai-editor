@@ -1,0 +1,15 @@
+{
+  "app": "ZenAI",
+  "channel": "dev",
+  "latest_version": "0.1.1-github-new",
+  "published_at": "2026-06-11T13:31:22Z",
+  "min_supported_version": "0.1.0",
+  "update_url": "https://github.com/sanyastylee-ctrl/zen-ai-editor/releases/download/v0.1.1-github-updater-rc-20260611/ZenAI-v0.1.1-github-new-win64-update.zip",
+  "sha256": "f523034254bca7720b55def8ff838e8490673afccaea8b19604017739f304fcc",
+  "size": 296083634,
+  "release_notes": [
+    "GitHub hosted updater smoke."
+  ],
+  "requires_full_update": true,
+  "critical": false
+}
